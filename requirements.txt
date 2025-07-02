@@ -1,0 +1,11 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+requests>=2.28.0
+
+# Visualization (optional but recommended)
+dearpygui>=1.9.0
+
+# Performance optimization (optional)
+# Uncomment if you have CUDA 11.6+ and want faster attention
+# flash-attn>=2.0.0 

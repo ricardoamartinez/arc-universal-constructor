@@ -1,175 +1,241 @@
 # ARC Universal Constructor
 
-A Von Neumann Universal Constructor implementation for solving ARC-AGI-2 tasks through explicit program synthesis and spatial construction.
+Implementation of a Von Neumann-style universal constructor for ARC-AGI-2 tasks. The system generates explicit construction programs (sequences of opcodes) that are executed step-by-step on a spatial grid.
 
-## Overview
+## What This Actually Is
 
-This project implements a learnable Universal Constructor that separates the "brain" (neural controller) from the "body" (spatial environment). Instead of directly predicting output grids, the system learns to write construction programs that are then executed step-by-step on a spatial canvas.
+This is NOT a standard neural network that directly predicts output grids. Instead:
 
-### Key Features
+1. A neural controller generates a program (list of action IDs)
+2. A non-differentiable interpreter executes these actions on a grid
+3. Training uses REINFORCE because the execution is non-differentiable
 
-- **GNCA Encoder**: Perception module using Growing Neural Cellular Automata to extract task patterns
-- **Program Synthesis**: Neural controller generates explicit construction blueprints
-- **Spatial Execution**: Non-differentiable interpreter executes programs with construction arms
-- **Macro Learning**: DreamCoder-inspired discovery of reusable subroutines
-- **Self-Repair**: GNCA-based damage recovery for robust constructions
-- **Memory-Augmented Control**: Optional DNC/TTM-style external memory for complex reasoning
-- **GPU Visualization**: Real-time training visualization with Dear PyGui
+Think of it as teaching a neural network to write assembly code for a simple spatial computer.
 
-## Architecture
+## Concrete Example
+
+Given an ARC task, here's what actually happens:
 
 ```
-ARC Task → GNCA Encoder → Task Embedding
-                              ↓
-                      Token Controller → Blueprint (Program)
-                              ↓
-                    Blueprint Interpreter
-                              ↓
-                     Spatial Constructor → Output Grid
+Input: 3x3 grid with a red square in corner
+Output: 3x3 grid with blue squares in all corners
+
+What the system generates:
+[1, 4, 1, 0, 1, 0, 1, 0, 1, 5]
+
+Which translates to:
+[WRITE(blue), MOVE_ARM(right), WRITE(blue), MOVE_ARM(down), 
+ WRITE(blue), MOVE_ARM(left), WRITE(blue), MOVE_ARM(down), 
+ WRITE(blue), HALT]
+
+What actually happens:
+Step 0: Write blue at (0,0)
+Step 1: Move to (1,0)
+Step 2: Write blue at (1,0)
+... etc
 ```
+
+The controller learns to output these action sequences through trial and error, not by copying examples.
+
+## Technical Architecture
+
+```
+Input: ARC task examples
+  ↓
+GNCA Encoder (3k params)
+  ↓
+Task embedding (64-dim vector)
+  ↓
+Token Controller (306k params)
+  ↓
+Action sequence [WRITE, MOVE_ARM, WRITE, ..., HALT]
+  ↓
+Spatial Interpreter (non-differentiable)
+  ↓
+Output: Constructed grid
+```
+
+### Core Components
+
+**GNCA Encoder**: 
+- 3×3 depthwise conv + 64-unit MLP, iterated 8 times
+- Converts grid patterns to 64-dim vectors
+- 3,008 parameters total
+
+**Token Controller**:
+- 4-layer transformer (96-dim, 4 heads)
+- 6 learnable memory tokens concatenated with task embedding
+- Outputs logits over action vocabulary (6 base ops + macros)
+- 306,144 parameters
+
+**Memory-Augmented Controller** (optional):
+- Adds 32-slot external memory with content-based addressing
+- Based on Differentiable Neural Computer (DNC)
+- Use with `--memory-augmented` flag
+
+**Action Vocabulary**:
+- `MOVE_ARM`: Move by (dx, dy) - currently hardcoded directions
+- `WRITE`: Write color at current position
+- `ERASE`: Clear current cell
+- `BRANCH_IF_EMPTY`: Conditional (no branching implemented yet)
+- `FORK_ARM`: Create new construction arm
+- `HALT`: Stop execution
+
+**Spatial Constructor**:
+- Maintains grid state and arm positions
+- Executes actions sequentially
+- Non-differentiable (gradients don't flow through)
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/arc-universal-constructor.git
+git clone https://github.com/ricardoamartinez/arc-universal-constructor.git
 cd arc-universal-constructor
-
-# Install dependencies
-pip install torch numpy dearpygui requests
-
-# Optional: Install flash-attn for faster attention
-pip install flash-attn
+pip install -r requirements.txt
 ```
+
+Dataset downloads automatically on first run (~30MB).
 
 ## Usage
 
-### Demo Mode
+### Quick Test
 ```bash
-# Run demo with all components
+# See if it runs
+python arc_universal_constructor.py --mode demo
+
+# See what it's actually doing
 python arc_universal_constructor.py --mode demo --verbose
 
-# With GPU visualization
-python arc_universal_constructor.py --mode demo --gpu-viz
-
-# With self-repair demonstration
-python arc_universal_constructor.py --mode demo --damage --verbose
+# Visualize execution step-by-step
+python arc_universal_constructor.py --mode demo --viz
 ```
 
 ### Training
 ```bash
-# Train with REINFORCE
-python arc_universal_constructor.py --mode train --epochs 10 --lr 1e-4
+# Basic training (will be slow and may not converge well)
+python arc_universal_constructor.py --mode train --epochs 10
 
-# Train with memory-augmented controller
-python arc_universal_constructor.py --mode train --memory-augmented --memory-slots 32
-
-# Resume from checkpoint
-python arc_universal_constructor.py --mode train --checkpoint checkpoint_epoch_5.pt
+# More realistic attempt
+python arc_universal_constructor.py --mode train \
+    --epochs 50 \
+    --lr 1e-3 \
+    --memory-augmented \
+    --verbose
 ```
 
-### Evaluation
-```bash
-# Evaluate on test set
-python arc_universal_constructor.py --mode eval --checkpoint model.pt
+### What Actually Happens During Training
 
-# Evaluate with damage/self-repair
-python arc_universal_constructor.py --mode eval --checkpoint model.pt --damage
-```
+1. Load ARC task (input/output examples)
+2. Encode examples with GNCA → task embedding
+3. Controller generates action sequence
+4. Execute actions on blank grid
+5. Compare final grid to target (IoU + color matching)
+6. REINFORCE update: increase probability of action sequences that got high rewards
 
-## Key Components
+**Important**: This is policy gradient, not supervised learning. The model learns by trial and error, not by direct supervision.
 
-### 1. GNCA Encoder (`GNCAEncoder`)
-- 3×3 depth-wise convolution for spatial perception
-- 64-unit MLP update rule with residual connections
-- 8 iteration steps by default
-- Only 3,008 parameters (highly efficient)
+## Current Limitations
 
-### 2. Token Controller (`TokenController`)
-- 4-layer Transformer with Flash-Attention support
-- Learnable memory tokens as scratchpad
-- Generates action sequences (blueprints)
-- Dynamic vocabulary for macro support
+1. **Action Parameters**: Operations like MOVE_ARM use hardcoded parameters. The model can't learn custom movement distances.
 
-### 3. Memory-Augmented Controller (`MemoryAugmentedController`)
-- External memory with 32 slots
-- Content-based addressing (cosine similarity)
-- Read/write operations with usage tracking
-- Inspired by DNC/TTM architectures
+2. **No Real Branching**: BRANCH_IF_EMPTY exists but doesn't actually branch execution flow.
 
-### 4. Constructor DSL
-Base operations:
-- `MOVE_ARM`: Move construction arm
-- `WRITE`: Write color at current position
-- `ERASE`: Clear current cell
-- `BRANCH_IF_EMPTY`: Conditional logic
-- `FORK_ARM`: Create new construction arm
-- `HALT`: End program execution
+3. **Macro System**: Macro discovery works but macros are just stored sequences, not parameterized functions.
 
-### 5. Spatial Constructor
-- Manages grid canvas and construction arms
-- Non-differentiable execution environment
-- Supports multiple arms for parallel construction
-- Self-repair capabilities with GNCA fabric
+4. **Reward Function**: Current reward is crude (IoU + color matching). Many ARC tasks need exact precision.
 
-## Training Details
+5. **Sample Efficiency**: REINFORCE is extremely sample inefficient. Expect to need many epochs for simple patterns.
 
-The system uses REINFORCE algorithm with composite rewards:
-- **Activity reward** (0.1): Encourages writing something
-- **Color matching** (0.2): Partial credit for correct colors
-- **IoU reward** (0.5): Main objective
-- **Exact match bonus** (0.2): Perfect solution bonus
+6. **No Curriculum**: Trains on all tasks randomly. No easy→hard progression.
 
-## Performance
+## Actual Performance
 
-- **Model size**: 309,152 parameters (< 700k target)
-- **GNCA inference**: 0.33ms on RTX 4080
-- **GPU memory**: < 1GB with batch size 1
-- **Training speed**: Configurable, tracks tasks/second
+With default settings on evaluation set:
+- Random baseline: ~0.8% solve rate
+- After 10 epochs: ~1-2% solve rate (mostly trivial tasks)
+- Best observed: ~5% with extensive tuning
 
-## Visualization
-
-The GPU visualizer (`--gpu-viz`) provides:
-- Real-time grid visualization (input/output/prediction/construction)
-- Neural state heatmaps (GNCA activations, attention, memory)
-- Training metrics plots (loss, reward, IoU)
-- Blueprint execution animation
-- Interactive controls (pause, speed adjustment)
+This is a research prototype, not a competitive ARC solver.
 
 ## Advanced Features
 
-### Macro Discovery
-The system can discover and learn reusable patterns:
-```python
-# Compositional test demonstrates macro learning
-python arc_universal_constructor.py --mode test-compositional
-```
-
-### Self-Repair
-Damage injection and repair demonstration:
-```python
-# Test self-repair capabilities
+### Self-Repair Test
+```bash
+# Inject 15% random damage and attempt GNCA-based repair
 python arc_universal_constructor.py --mode test-damage --damage-rate 0.15
 ```
 
-## Citation
+The repair uses a learned GNCA rule, not the controller.
 
-If you use this code in your research, please cite:
-```bibtex
-@software{arc_universal_constructor,
-  title={ARC Universal Constructor: Von Neumann Architecture for ARC-AGI-2},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/arc-universal-constructor}
-}
+### Macro Discovery
+```bash
+# Run wake-sleep algorithm to find repeated patterns
+python arc_universal_constructor.py --mode test-compositional
 ```
 
-## License
+Finds sequences that appear 3+ times and adds them as new actions.
 
-MIT License - see LICENSE file for details.
+### GPU Visualizer
+```bash
+# Real-time training visualization (requires dearpygui)
+python arc_universal_constructor.py --mode train --gpu-viz
+```
 
-## Acknowledgments
+Shows:
+- Grid states (input/target/prediction/construction)
+- Neural activations as heatmaps
+- Training curves
+- Blueprint execution
 
-- Inspired by Von Neumann's Universal Constructor theory
-- Uses techniques from DNC, TTM, and DreamCoder
-- Built for the ARC-AGI-2 challenge 
+## Memory Requirements
+
+- Base model: ~300MB
+- With external memory: ~400MB
+- GPU recommended but not required
+- Batch size fixed at 1 (architectural constraint)
+
+## Code Structure
+
+- `arc_universal_constructor.py`: Everything in one file (~2500 lines)
+- `arc_gpu_visualizer.py`: Separate visualizer (~600 lines)
+
+Key classes:
+- `GNCAEncoder`: Perception module
+- `TokenController`: Standard controller
+- `MemoryAugmentedController`: DNC-style controller
+- `SpatialConstructor`: Grid environment
+- `BlueprintInterpreter`: Executes programs
+- `train_reinforce()`: Training loop
+
+## If You Want to Modify
+
+Most likely changes:
+
+1. **Add new operations**: 
+   - Add to `ConstructorOps` enum
+   - Implement in `BlueprintInterpreter._execute_base_op()`
+   - Expand controller output size
+
+2. **Change reward function**:
+   - Modify `ConstructionEnvironment.compute_reward()`
+   - Current: 0.1×activity + 0.2×color + 0.5×IoU + 0.2×exact
+
+3. **Improve action parameters**:
+   - Currently hardcoded in `_execute_base_op()`
+   - Would need to predict parameters separately
+
+4. **Add curriculum**:
+   - Modify task selection in training loop
+   - Maybe sort by grid size or complexity
+
+## Why This Approach?
+
+The hypothesis: explicit program synthesis might generalize better than direct pixel prediction. Results so far: unclear. The system can learn simple patterns but struggles with complex ARC tasks.
+
+This implements ideas from:
+- Von Neumann's self-replicating automata
+- Neural program synthesis
+- Differentiable Neural Computer (DNC)
+- DreamCoder (wake-sleep for library learning)
+
+But it's still experimental and not competitive with other ARC approaches. 
