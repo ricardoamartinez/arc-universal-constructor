@@ -179,15 +179,16 @@ Finds sequences that appear 3+ times and adds them as new actions.
 
 ### GPU Visualizer
 ```bash
-# Real-time training visualization (requires dearpygui)
+# Real-time training visualization with Dear PyGui
 python arc_universal_constructor.py --mode train --gpu-viz
 ```
 
 Shows:
 - Grid states (input/target/prediction/construction)
-- Neural activations as heatmaps
-- Training curves
-- Blueprint execution
+- Neural activations as heatmaps (GNCA, attention, memory)
+- Training metrics and loss curves
+- Blueprint execution with construction arms
+- Interactive controls (pause, step, speed)
 
 ## Memory Requirements
 
@@ -198,13 +199,13 @@ Shows:
 
 ## Code Structure
 
-- `arc_universal_constructor.py`: Everything in one file (~2500 lines)
-- `arc_gpu_visualizer.py`: Separate visualizer (~600 lines)
+- `arc_universal_constructor.py`: Everything in one file (~2700 lines)
+- `arc_gpu_visualizer.py`: Dear PyGui visualizer (~600 lines)
 
 Key classes:
 - `GNCAEncoder`: Perception module
-- `TokenController`: Standard controller
-- `MemoryAugmentedController`: DNC-style controller
+- `TokenController`: Standard TTM-style controller with learnable memory tokens
+- `MemoryAugmentedController`: Enhanced controller with external memory (DNC-style)
 - `SpatialConstructor`: Grid environment
 - `BlueprintInterpreter`: Executes programs
 - `train_reinforce()`: Training loop
