@@ -425,8 +425,9 @@ class ARCGPUVisualizer:
     
     def _get_op_name(self, op_id: int) -> str:
         """Get operation name from ID"""
-        # ConstructorOps enum values start at 1, blueprint uses 0-indexed
-        op_names = ["MOVE_ARM", "WRITE", "ERASE", "BRANCH_IF_EMPTY", "FORK_ARM", "HALT"]
+        # Updated minimal DSL operations
+        op_names = ["MOVE_ARM", "WRITE", "READ", "JUMP", "JUMP_IF_EQUAL", "JUMP_IF_NOT_EQUAL",
+                    "SET_REG", "INC_REG", "DEC_REG", "COMPARE_REG", "FORK_ARM", "SWITCH_ARM", "HALT"]
         if op_id < len(op_names):
             return op_names[op_id]
         else:

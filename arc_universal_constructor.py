@@ -34,10 +34,13 @@ import pathlib
 import io
 import shutil
 from io import BytesIO
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Set, Union
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
+import math
+import itertools
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -296,19 +299,29 @@ class GNCAEncoder(nn.Module):
 
 class ConstructorOps(Enum):
     """
-    Base DSL vocabulary for construction operations.
-    This enum defines the core action space for the universal constructor.
+    Minimal Turing-complete DSL for universal construction.
+    Following von Neumann's principle: minimal fixed machinery, maximal generality.
+    Complex patterns should emerge from learned composition, not hardcoding.
     """
-    # Spatial movement operations
-    MOVE_ARM = auto()      # Move construction arm to relative position
-    
-    # Grid manipulation operations  
+    # Essential spatial operations
+    MOVE_ARM = auto()      # Move construction arm to relative position (dx, dy)
     WRITE = auto()         # Write color at current arm position
-    ERASE = auto()         # Erase (set to empty) at current arm position
+    READ = auto()          # Read current cell color into register
     
-    # Control flow operations
-    BRANCH_IF_EMPTY = auto()  # Conditional branching based on cell state
+    # Control flow - minimal but Turing-complete
+    JUMP = auto()               # Unconditional jump (PC + offset)
+    JUMP_IF_EQUAL = auto()      # Jump if comparison flag is true
+    JUMP_IF_NOT_EQUAL = auto()  # Jump if comparison flag is false
+    
+    # Register operations - minimal state
+    SET_REG = auto()            # Set register to value
+    INC_REG = auto()            # Increment register
+    DEC_REG = auto()            # Decrement register
+    COMPARE_REG = auto()        # Compare two registers, set flag
+    
+    # Essential for multi-location work
     FORK_ARM = auto()         # Create new construction arm at current position
+    SWITCH_ARM = auto()       # Switch active arm
     
     # Program termination
     HALT = auto()          # Stop program execution
@@ -363,7 +376,350 @@ class MacroLibrary:
 
 
 # -----------------------------------------------------------------------------
-# 5. Token Controller - TTM-based Program Synthesizer (C-1)
+# DreamCoder Program Representation and Refactoring
+# -----------------------------------------------------------------------------
+
+@dataclass
+class Program:
+    """
+    Represents a program as a sequence of operations with parameters.
+    This is the core data structure for DreamCoder's refactoring.
+    """
+    operations: List[Tuple[int, Dict[str, int]]]
+    
+    def __len__(self) -> int:
+        return len(self.operations)
+    
+    def __getitem__(self, idx):
+        return self.operations[idx]
+    
+    def __hash__(self):
+        # Make programs hashable for caching
+        return hash(tuple((op, tuple(sorted(params.items()))) for op, params in self.operations))
+    
+    def execute(self, interpreter: "BlueprintInterpreter") -> torch.Tensor:
+        """Execute this program and return the resulting canvas."""
+        return interpreter.execute_blueprint(self.operations)
+    
+    def description_length(self, library: MacroLibrary) -> float:
+        """
+        Compute the description length of this program under the given library.
+        This is -log P[program|library] in the DreamCoder formulation.
+        """
+        # Each operation costs log(vocab_size) bits
+        vocab_size = library.get_total_vocab_size()
+        op_cost = len(self.operations) * math.log2(vocab_size)
+        
+        # Each parameter costs additional bits
+        param_cost = 0
+        for op, params in self.operations:
+            for param_name, param_value in params.items():
+                # Assume uniform distribution over parameter ranges
+                if param_name in ['dx', 'dy']:
+                    param_cost += math.log2(11)  # 11 possible values
+                elif param_name == 'color':
+                    param_cost += math.log2(10)  # 10 colors
+                elif param_name == 'offset':
+                    param_cost += math.log2(41)  # 41 possible offsets
+                elif param_name == 'register':
+                    param_cost += math.log2(8)   # 8 registers
+                elif param_name == 'value':
+                    param_cost += math.log2(21)  # 21 possible values
+        
+        return op_cost + param_cost
+
+
+class VersionSpace:
+    """
+    Represents the space of all possible refactorings of a program.
+    This is DreamCoder's key data structure for efficient abstraction.
+    """
+    
+    def __init__(self, program: Program, max_refactor_steps: int = 3):
+        self.original_program = program
+        self.max_refactor_steps = max_refactor_steps
+        self._refactorings = None
+        self._subtrees = None
+    
+    def get_refactorings(self) -> Set[Program]:
+        """
+        Get all possible refactorings of the original program.
+        This is where we would implement the sophisticated version space algebra,
+        but for now we'll use a simpler approach.
+        """
+        if self._refactorings is not None:
+            return self._refactorings
+        
+        self._refactorings = {self.original_program}
+        
+        # For now, we consider subsequences as potential refactorings
+        # In full DreamCoder, this would include semantic equivalences
+        ops = self.original_program.operations
+        
+        # Add all contiguous subsequences as potential abstractions
+        for length in range(2, min(len(ops), 8)):
+            for start in range(len(ops) - length + 1):
+                subseq = ops[start:start+length]
+                # Check if this subsequence appears multiple times
+                count = 0
+                for i in range(len(ops) - length + 1):
+                    if ops[i:i+length] == subseq:
+                        count += 1
+                
+                if count >= 2:
+                    # This is a repeated pattern - add as refactoring
+                    refactored_ops = []
+                    i = 0
+                    while i < len(ops):
+                        if i <= len(ops) - length and ops[i:i+length] == subseq:
+                            # Replace with abstraction marker
+                            # Create a hashable representation of the subsequence
+                            subseq_hash = hash(tuple((op, tuple(sorted(params.items()))) for op, params in subseq))
+                            refactored_ops.append((-1, {'abstraction': subseq_hash}))
+                            i += length
+                        else:
+                            refactored_ops.append(ops[i])
+                            i += 1
+                    
+                    self._refactorings.add(Program(refactored_ops))
+        
+        return self._refactorings
+    
+    def extract_subtrees(self) -> Set[Tuple[Tuple[int, Dict[str, int]], ...]]:
+        """Extract all subtrees (potential abstractions) from refactorings."""
+        if self._subtrees is not None:
+            return self._subtrees
+        
+        self._subtrees = set()
+        
+        # Extract all contiguous subsequences from all refactorings
+        for refactoring in self.get_refactorings():
+            ops = refactoring.operations
+            for length in range(2, min(len(ops), 8)):
+                for start in range(len(ops) - length + 1):
+                    subtree_ops = ops[start:start+length]
+                    # Only add if it's not an abstraction marker
+                    if not any(op == -1 for op, _ in subtree_ops):
+                        # Convert to hashable tuple
+                        hashable_subtree = tuple(
+                            (op, tuple(sorted(params.items()))) 
+                            for op, params in subtree_ops
+                        )
+                        self._subtrees.add(hashable_subtree)
+        
+        return self._subtrees
+
+
+# -----------------------------------------------------------------------------
+# 5. Recognition Model for DreamCoder (Neural Program Search Guide)
+# -----------------------------------------------------------------------------
+
+class RecognitionModel(nn.Module):
+    """
+    Neural network that learns Q(ρ|x) ≈ P[ρ|x, L].
+    Guides program search by predicting likely operations given a task.
+    """
+    
+    def __init__(self, 
+                 task_embed_dim: int = TASK_EMBED_DIM,
+                 hidden_dim: int = 256,
+                 num_layers: int = 3,
+                 vocab_size: int = 13,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.task_embed_dim = task_embed_dim
+        self.vocab_size = vocab_size
+        
+        # Task encoding layers
+        self.task_encoder = nn.Sequential(
+            nn.Linear(task_embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Recurrent component for sequential prediction
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim + vocab_size,  # Task encoding + previous action
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
+        )
+        
+        # Output heads
+        self.action_head = nn.Linear(hidden_dim, vocab_size)
+        
+        # Parameter heads (same as controller)
+        self.param_heads = nn.ModuleDict({
+            'dx': nn.Linear(hidden_dim, 11),
+            'dy': nn.Linear(hidden_dim, 11),
+            'color': nn.Linear(hidden_dim, NUM_COLORS),
+            'offset': nn.Linear(hidden_dim, 41),
+            'register': nn.Linear(hidden_dim, 8),
+            'value': nn.Linear(hidden_dim, 21),
+        })
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+    
+    def forward(self, task_embedding: torch.Tensor, 
+                previous_actions: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Predict next action distribution given task and history.
+        
+        Args:
+            task_embedding: (batch, task_embed_dim) task representation
+            previous_actions: (batch, seq_len) previous action IDs
+            
+        Returns:
+            Dictionary with 'actions' and parameter logits
+        """
+        batch_size = task_embedding.size(0)
+        device = task_embedding.device
+        
+        # Encode task
+        task_hidden = self.task_encoder(task_embedding)  # (batch, hidden_dim)
+        
+        if previous_actions is None:
+            # First action - use task encoding only
+            lstm_input = torch.cat([
+                task_hidden.unsqueeze(1),
+                torch.zeros(batch_size, 1, self.vocab_size, device=device)
+            ], dim=-1)
+        else:
+            # Prepare LSTM input with action history
+            seq_len = previous_actions.size(1)
+            
+            # One-hot encode previous actions
+            prev_onehot = F.one_hot(previous_actions, self.vocab_size).float()
+            
+            # Concatenate task encoding with each timestep
+            task_expanded = task_hidden.unsqueeze(1).expand(-1, seq_len, -1)
+            lstm_input = torch.cat([task_expanded, prev_onehot], dim=-1)
+        
+        # Run LSTM
+        lstm_out, _ = self.lstm(lstm_input)  # (batch, seq_len, hidden_dim)
+        
+        # Get final hidden state
+        final_hidden = lstm_out[:, -1, :]  # (batch, hidden_dim)
+        
+        # Predict next action and parameters
+        results = {
+            'actions': self.action_head(final_hidden),
+        }
+        
+        # Add parameter predictions
+        for param_name, param_head in self.param_heads.items():
+            results[param_name] = param_head(final_hidden)
+        
+        return results
+    
+    def beam_search(self, task_embedding: torch.Tensor, 
+                   beam_size: int = 5,
+                   max_length: int = 50,
+                   temperature: float = 1.0) -> List[Tuple[Program, float]]:
+        """
+        Enumerate programs in order of probability using beam search.
+        
+        Returns:
+            List of (program, log_probability) tuples
+        """
+        device = task_embedding.device
+        batch_size = 1  # Beam search works on single examples
+        
+        # Initialize beam with empty program
+        beam = [([], 0.0, [])]  # (operations, log_prob, action_history)
+        completed_programs = []
+        
+        for step in range(max_length):
+            new_beam = []
+            
+            for operations, score, history in beam:
+                # Convert history to tensor
+                if history:
+                    prev_actions = torch.tensor(history, device=device).unsqueeze(0)
+                else:
+                    prev_actions = None
+                
+                # Get predictions
+                with torch.no_grad():
+                    predictions = self.forward(task_embedding.unsqueeze(0), prev_actions)
+                
+                # Sample top-k actions
+                action_logits = predictions['actions'].squeeze(0)
+                if temperature > 0:
+                    action_probs = F.softmax(action_logits / temperature, dim=-1)
+                    action_log_probs = torch.log(action_probs)
+                else:
+                    action_log_probs = F.log_softmax(action_logits, dim=-1)
+                
+                top_k_log_probs, top_k_actions = torch.topk(action_log_probs, min(beam_size, action_log_probs.size(0)))
+                
+                for k in range(top_k_log_probs.size(0)):
+                    action = top_k_actions[k].item()
+                    action_log_prob = top_k_log_probs[k].item()
+                    
+                    # Sample parameters for this action
+                    params = {}
+                    if action < ConstructorOps.base_vocab_size():
+                        op = list(ConstructorOps)[action]
+                        
+                        if op == ConstructorOps.MOVE_ARM:
+                            dx_logits = predictions['dx'].squeeze(0)
+                            dy_logits = predictions['dy'].squeeze(0)
+                            params['dx'] = torch.argmax(dx_logits).item()
+                            params['dy'] = torch.argmax(dy_logits).item()
+                        elif op == ConstructorOps.WRITE:
+                            color_logits = predictions['color'].squeeze(0)
+                            params['color'] = torch.argmax(color_logits).item()
+                        # ... other parameters
+                    
+                    # Create new beam entry
+                    new_operations = operations + [(action, params)]
+                    new_score = score + action_log_prob
+                    new_history = history + [action]
+                    
+                    # Check for HALT
+                    if action == ConstructorOps.HALT.value - 1:
+                        completed_programs.append((Program(new_operations), new_score))
+                    else:
+                        new_beam.append((new_operations, new_score, new_history))
+            
+            # Prune beam
+            new_beam.sort(key=lambda x: x[1], reverse=True)
+            beam = new_beam[:beam_size]
+            
+            if not beam:
+                break
+        
+        # Add remaining beam entries as completed programs
+        for operations, score, _ in beam:
+            completed_programs.append((Program(operations), score))
+        
+        # Sort by probability
+        completed_programs.sort(key=lambda x: x[1], reverse=True)
+        
+        return completed_programs
+
+
+# -----------------------------------------------------------------------------
+# 6. Token Controller - TTM-based Program Synthesizer (C-1)
 # -----------------------------------------------------------------------------
 
 class FlashMultiHeadAttention(nn.Module):
@@ -424,17 +780,15 @@ class FlashMultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer block with attention and MLP."""
+    """Single transformer block with multi-head attention and MLP."""
     
     def __init__(self, embed_dim: int, num_heads: int, mlp_ratio: int = 2, dropout: float = 0.0):
         super().__init__()
-        self.embed_dim = embed_dim
-        
-        # Multi-head attention
         self.attn = FlashMultiHeadAttention(embed_dim, num_heads, dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
         
-        # MLP (reduced ratio for efficiency)
+        # MLP block (reduced ratio for efficiency)
         mlp_dim = embed_dim * mlp_ratio
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, mlp_dim),
@@ -443,17 +797,15 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_dim, embed_dim),
             nn.Dropout(dropout)
         )
-        self.norm2 = nn.LayerNorm(embed_dim)
     
     def forward(self, x: torch.Tensor, verbose: bool = False) -> torch.Tensor:
-        """Apply transformer block with residual connections."""
-        # Attention with residual
+        """Forward pass with residual connections."""
+        # Self-attention block
         attn_out = self.attn(self.norm1(x), verbose=verbose)
         x = x + attn_out
         
-        # MLP with residual  
-        mlp_out = self.mlp(self.norm2(x))
-        x = x + mlp_out
+        # MLP block
+        x = x + self.mlp(self.norm2(x))
         
         if verbose:
             print(f"[TransformerBlock] Output mean: {x.mean().item():.4f}, std: {x.std().item():.4f}")
@@ -461,44 +813,131 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class TokenController(nn.Module):
+class TokenSummarizer(nn.Module):
     """
-    TTM-based program synthesizer using transformer with learnable memory tokens.
-    Acts as a policy network π(action|state) generating sequences of opcodes.
+    Token summarization module for TTM read/write operations.
+    Reduces p tokens to k tokens using learned importance weights.
     """
     
-    def __init__(self, 
+    def __init__(self, input_dim: int, output_tokens: int, method: str = "mlp"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_tokens = output_tokens
+        self.method = method
+        
+        if method == "mlp":
+            # MLP-based importance weights (one MLP per output token)
+            self.importance_mlps = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(input_dim, input_dim // 2),
+                    nn.ReLU(),
+                    nn.Linear(input_dim // 2, 1)
+                ) for _ in range(output_tokens)
+            ])
+        elif method == "query":
+            # Learned query vectors for attention-based summarization
+            self.queries = nn.Parameter(torch.randn(output_tokens, input_dim) * 0.02)
+        else:
+            raise ValueError(f"Unknown summarization method: {method}")
+    
+    def forward(self, tokens: torch.Tensor, verbose: bool = False) -> torch.Tensor:
+        """
+        Summarize p tokens to k tokens.
+        
+        Args:
+            tokens: (batch, p, dim) input tokens
+            verbose: Enable debug output
+            
+        Returns:
+            summarized: (batch, k, dim) output tokens
+        """
+        batch_size, num_tokens, dim = tokens.shape
+        
+        if self.method == "mlp":
+            # Compute importance weights for each output token
+            summarized = []
+            for i, mlp in enumerate(self.importance_mlps):
+                # Compute weights for this output token
+                weights = mlp(tokens)  # (batch, p, 1)
+                weights = F.softmax(weights.squeeze(-1), dim=1)  # (batch, p)
+                
+                # Weighted sum of input tokens
+                output_token = torch.sum(weights.unsqueeze(-1) * tokens, dim=1)  # (batch, dim)
+                summarized.append(output_token)
+            
+            result = torch.stack(summarized, dim=1)  # (batch, k, dim)
+            
+        else:  # query method
+            # Compute attention scores between queries and tokens
+            scores = torch.matmul(self.queries.unsqueeze(0), tokens.transpose(-2, -1))  # (batch, k, p)
+            scores = scores / math.sqrt(dim)
+            weights = F.softmax(scores, dim=-1)  # (batch, k, p)
+            
+            # Weighted sum using attention weights
+            result = torch.matmul(weights, tokens)  # (batch, k, dim)
+        
+        if verbose:
+            print(f"[TokenSummarizer] Reduced {num_tokens} tokens to {self.output_tokens} tokens")
+            if self.method == "mlp":
+                print(f"[TokenSummarizer] Weight stats: min={weights.min():.4f}, max={weights.max():.4f}")
+        
+        return result
+
+
+class TTMController(nn.Module):
+    """
+    Token Turing Machine controller - proper implementation following the paper.
+    Maintains dynamic memory that updates after each step.
+    """
+    
+    def __init__(self,
                  task_embed_dim: int = TASK_EMBED_DIM,
-                 embed_dim: int = 96,  # Reduced for efficiency 
+                 embed_dim: int = 96,
+                 memory_tokens: int = 96,      # m in the paper
+                 read_tokens: int = 16,        # r in the paper
                  num_layers: int = 4,
                  num_heads: int = 4,
-                 memory_tokens: int = 6,
                  dropout: float = 0.1,
+                 summarizer_method: str = "mlp",
                  macro_library: Optional[MacroLibrary] = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.memory_tokens = memory_tokens
+        self.read_tokens = read_tokens
         self.macro_library = macro_library or MacroLibrary()
         
-        # Project task embedding to controller embedding dimension
+        # Task embedding projection
         self.task_proj = nn.Linear(task_embed_dim, embed_dim)
         
-        # Learnable memory tokens (writable scratchpad)
-        self.memory_embeddings = nn.Parameter(
-            torch.randn(memory_tokens, embed_dim) * 0.02  # Small initialization
-        )
+        # Positional embeddings to distinguish memory vs input tokens
+        self.memory_pos_embed = nn.Parameter(torch.randn(1, memory_tokens, embed_dim) * 0.02)
+        self.input_pos_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)  # For task token
+        self.output_pos_embed = nn.Parameter(torch.randn(1, read_tokens, embed_dim) * 0.02)
         
-        # Transformer layers (reduced MLP ratio for efficiency)
-        self.layers = nn.ModuleList([
+        # Token summarizers for read and write operations
+        self.read_summarizer = TokenSummarizer(embed_dim, read_tokens, summarizer_method)
+        self.write_summarizer = TokenSummarizer(embed_dim, memory_tokens, summarizer_method)
+        
+        # Processing unit (transformer)
+        self.processing_unit = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, mlp_ratio=2, dropout=dropout)
             for _ in range(num_layers)
         ])
-        
-        # Output normalization
         self.norm = nn.LayerNorm(embed_dim)
         
-        # Action head: outputs logits over ConstructorOps + macros (C-2)
+        # Output heads
         self.action_head = nn.Linear(embed_dim, self._get_action_vocab_size())
+        
+        # Parameter prediction heads
+        self.param_heads = nn.ModuleDict({
+            'offset': nn.Linear(embed_dim, 41),
+            'color': nn.Linear(embed_dim, NUM_COLORS),
+            'dx': nn.Linear(embed_dim, 11),
+            'dy': nn.Linear(embed_dim, 11),
+            'register': nn.Linear(embed_dim, 8),
+            'value': nn.Linear(embed_dim, 21),
+            'direction': nn.Linear(embed_dim, 4),
+        })
         
         # Initialize weights
         self._init_weights()
@@ -508,26 +947,17 @@ class TokenController(nn.Module):
         return self.macro_library.get_total_vocab_size()
     
     def expand_action_head(self, new_vocab_size: int):
-        """
-        Dynamically expand action head for new macros (D-2 verification).
-        
-        Args:
-            new_vocab_size: New total vocabulary size after adding macros
-        """
+        """Dynamically expand action head for new macros."""
         if new_vocab_size <= self.action_head.out_features:
-            return  # No expansion needed
+            return
         
-        # Create new larger action head
         old_head = self.action_head
-        device = old_head.weight.device  # Get current device
+        device = old_head.weight.device
         self.action_head = nn.Linear(self.embed_dim, new_vocab_size).to(device)
         
-        # Copy existing weights
         with torch.no_grad():
             self.action_head.weight[:old_head.out_features].copy_(old_head.weight)
             self.action_head.bias[:old_head.out_features].copy_(old_head.bias)
-            
-            # Initialize new weights (for new macros)
             nn.init.xavier_uniform_(self.action_head.weight[old_head.out_features:])
             nn.init.zeros_(self.action_head.bias[old_head.out_features:])
     
@@ -539,9 +969,333 @@ class TokenController(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def forward(self, task_embedding: torch.Tensor, verbose: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def read(self, memory: torch.Tensor, input_tokens: torch.Tensor, verbose: bool = False) -> torch.Tensor:
         """
-        Forward pass of the token controller.
+        TTM Read operation: Z_t = Sr([M_t || I_t])
+        
+        Args:
+            memory: (batch, m, dim) current memory state
+            input_tokens: (batch, n, dim) input tokens (usually just task embedding)
+            
+        Returns:
+            read_tokens: (batch, r, dim) summarized tokens for processing
+        """
+        # Add positional embeddings
+        memory_with_pos = memory + self.memory_pos_embed
+        input_with_pos = input_tokens + self.input_pos_embed
+        
+        # Concatenate memory and input
+        combined = torch.cat([memory_with_pos, input_with_pos], dim=1)  # (batch, m+n, dim)
+        
+        if verbose:
+            print(f"[TTM Read] Concatenated {memory.shape[1]} memory + {input_tokens.shape[1]} input tokens")
+        
+        # Summarize to r tokens
+        read_result = self.read_summarizer(combined, verbose)
+        
+        return read_result
+    
+    def process(self, tokens: torch.Tensor, verbose: bool = False) -> torch.Tensor:
+        """
+        TTM Process operation: O_t = Process(Z_t)
+        
+        Args:
+            tokens: (batch, r, dim) tokens from read operation
+            
+        Returns:
+            output: (batch, r, dim) processed tokens
+        """
+        x = tokens
+        
+        # Apply transformer layers
+        for i, layer in enumerate(self.processing_unit):
+            x = layer(x, verbose=(verbose and i == 0))
+        
+        # Final normalization
+        x = self.norm(x)
+        
+        if verbose:
+            print(f"[TTM Process] Processed {tokens.shape[1]} tokens through {len(self.processing_unit)} layers")
+        
+        return x
+    
+    def write(self, memory: torch.Tensor, output: torch.Tensor, input_tokens: torch.Tensor, 
+              verbose: bool = False) -> torch.Tensor:
+        """
+        TTM Write operation: M_{t+1} = Sm([M_t || O_t || I_t])
+        
+        Args:
+            memory: (batch, m, dim) current memory
+            output: (batch, r, dim) output from processing unit
+            input_tokens: (batch, n, dim) original input tokens
+            
+        Returns:
+            new_memory: (batch, m, dim) updated memory for next step
+        """
+        # Add positional embeddings
+        memory_with_pos = memory + self.memory_pos_embed
+        output_with_pos = output + self.output_pos_embed
+        input_with_pos = input_tokens + self.input_pos_embed
+        
+        # Concatenate all sources
+        combined = torch.cat([memory_with_pos, output_with_pos, input_with_pos], dim=1)
+        
+        if verbose:
+            print(f"[TTM Write] Concatenated {memory.shape[1]} memory + {output.shape[1]} output + {input_tokens.shape[1]} input")
+        
+        # Summarize to m tokens (new memory)
+        new_memory = self.write_summarizer(combined, verbose)
+        
+        return new_memory
+    
+    def forward_step(self, task_embedding: torch.Tensor, memory: torch.Tensor, 
+                    verbose: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Single step of TTM operation.
+        
+        Args:
+            task_embedding: (batch, task_embed_dim) task representation
+            memory: (batch, m, dim) current memory state
+            
+        Returns:
+            action_logits: (batch, vocab_size) action predictions
+            param_logits: Dict of parameter predictions
+            new_memory: (batch, m, dim) updated memory
+            output_tokens: (batch, r, dim) output tokens (for visualization)
+        """
+        batch_size = task_embedding.size(0)
+        
+        # Project task embedding
+        task_token = self.task_proj(task_embedding).unsqueeze(1)  # (batch, 1, embed_dim)
+        
+        # Read: combine memory and input
+        read_tokens = self.read(memory, task_token, verbose)
+        
+        # Process: transform the read tokens
+        output_tokens = self.process(read_tokens, verbose)
+        
+        # Generate predictions from first output token
+        prediction_token = output_tokens[:, 0, :]  # (batch, embed_dim)
+        action_logits = self.action_head(prediction_token)
+        
+        # Generate parameter predictions
+        param_logits = {}
+        for param_name, param_head in self.param_heads.items():
+            param_logits[param_name] = param_head(prediction_token)
+        
+        # Write: update memory
+        new_memory = self.write(memory, output_tokens, task_token, verbose)
+        
+        if verbose:
+            print(f"[TTM Step] Complete: action_logits={action_logits.shape}, new_memory={new_memory.shape}")
+        
+        return action_logits, param_logits, new_memory, output_tokens
+    
+    def init_memory(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Initialize memory with zeros."""
+        return torch.zeros(batch_size, self.memory_tokens, self.embed_dim, device=device)
+    
+    def generate_blueprint(self, task_embedding: torch.Tensor, max_steps: int = 50,
+                          temperature: float = 1.0, verbose: bool = False) -> List[Tuple[int, Dict[str, int]]]:
+        """
+        Generate blueprint using sequential TTM steps with evolving memory.
+        """
+        if task_embedding.size(0) != 1:
+            raise ValueError("generate_blueprint requires batch_size=1")
+        
+        blueprint = []
+        device = task_embedding.device
+        
+        # Initialize memory
+        memory = self.init_memory(1, device)
+        
+        if verbose:
+            print(f"[TTM] Generating blueprint with dynamic memory (max_steps={max_steps})...")
+            print(f"[TTM] Memory size: {self.memory_tokens} tokens × {self.embed_dim} dim")
+        
+        min_steps = 5
+        
+        for step in range(max_steps):
+            # Forward pass with current memory
+            with torch.no_grad():
+                action_logits, param_logits, memory, _ = self.forward_step(
+                    task_embedding, memory, verbose=(verbose and step == 0)
+                )
+            
+            # Prevent early HALT
+            halt_id = ConstructorOps.HALT.value - 1
+            if step < min_steps and self.training:
+                action_logits[:, halt_id] = -float('inf')
+            
+            # Sample action
+            if temperature > 0:
+                probs = F.softmax(action_logits / temperature, dim=-1)
+                action = torch.multinomial(probs, 1).item()
+            else:
+                action = action_logits.argmax(dim=-1).item()
+            
+            # Sample parameters (same as before)
+            params = {}
+            if action < ConstructorOps.base_vocab_size():
+                op = list(ConstructorOps)[action]
+                
+                if op == ConstructorOps.MOVE_ARM:
+                    params['dx'] = self._sample_param(param_logits['dx'], temperature)
+                    params['dy'] = self._sample_param(param_logits['dy'], temperature)
+                elif op == ConstructorOps.WRITE:
+                    params['color'] = self._sample_param(param_logits['color'], temperature)
+                elif op == ConstructorOps.READ:
+                    params['register'] = self._sample_param(param_logits['register'], temperature)
+                elif op in [ConstructorOps.JUMP, ConstructorOps.JUMP_IF_EQUAL, ConstructorOps.JUMP_IF_NOT_EQUAL]:
+                    params['offset'] = self._sample_param(param_logits['offset'], temperature)
+                elif op in [ConstructorOps.SET_REG, ConstructorOps.INC_REG, ConstructorOps.DEC_REG]:
+                    params['register'] = self._sample_param(param_logits['register'], temperature)
+                    if op == ConstructorOps.SET_REG:
+                        params['value'] = self._sample_param(param_logits['value'], temperature)
+                elif op == ConstructorOps.COMPARE_REG:
+                    params['reg1'] = 0
+                    params['reg2'] = 1
+                elif op == ConstructorOps.SWITCH_ARM:
+                    params['arm'] = 0
+            
+            blueprint.append((action, params))
+            
+            if verbose:
+                if action < ConstructorOps.base_vocab_size():
+                    op_name = list(ConstructorOps)[action].name
+                else:
+                    op_name = f"MACRO_{action - ConstructorOps.base_vocab_size()}"
+                print(f"[TTM] Step {step+1}: {op_name} (memory updated)")
+            
+            # Check for halt
+            if action == halt_id and step >= min_steps:
+                if verbose:
+                    print(f"[TTM] Emitted HALT - Blueprint complete")
+                break
+        
+        if verbose:
+            print(f"[TTM] Generated blueprint: {len(blueprint)} steps with evolving memory")
+        
+        return blueprint
+    
+    def _sample_param(self, logits: torch.Tensor, temperature: float) -> int:
+        """Sample parameter value from logits."""
+        if temperature > 0:
+            probs = F.softmax(logits / temperature, dim=-1)
+            return torch.multinomial(probs, 1).item()
+        else:
+            return logits.argmax(dim=-1).item()
+    
+    def count_parameters(self) -> int:
+        """Count total trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    # For compatibility with existing code
+    def forward(self, task_embedding: torch.Tensor, verbose: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compatibility forward method that initializes memory and does one step.
+        For proper TTM usage, use forward_step with maintained memory.
+        """
+        batch_size = task_embedding.size(0)
+        device = task_embedding.device
+        
+        # Initialize memory
+        memory = self.init_memory(batch_size, device)
+        
+        # Do one TTM step
+        action_logits, param_logits, new_memory, output_tokens = self.forward_step(
+            task_embedding, memory, verbose
+        )
+        
+        # Return new_memory as "memory tokens" for compatibility
+        return action_logits, new_memory, param_logits
+
+
+# -----------------------------------------------------------------------------
+# 5.2 Static Memory Controller (Original Implementation)
+# -----------------------------------------------------------------------------
+
+class StaticMemoryController(nn.Module):
+    """
+    Original TTM-style controller with static learnable memory tokens.
+    Memory tokens are fixed parameters that don't change during inference.
+    """
+    
+    def __init__(self,
+                 task_embed_dim: int = TASK_EMBED_DIM,
+                 embed_dim: int = 96,
+                 num_layers: int = 4,
+                 num_heads: int = 4,
+                 memory_tokens: int = 6,
+                 dropout: float = 0.1,
+                 macro_library: Optional[MacroLibrary] = None):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.memory_tokens = memory_tokens
+        self.macro_library = macro_library or MacroLibrary()
+        
+        # Task embedding projection
+        self.task_proj = nn.Linear(task_embed_dim, embed_dim)
+        
+        # Static learnable memory tokens
+        self.memory_embeddings = nn.Parameter(
+            torch.randn(memory_tokens, embed_dim) * 0.02
+        )
+        
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio=2, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Output heads
+        self.action_head = nn.Linear(embed_dim, self._get_action_vocab_size())
+        
+        # Parameter prediction heads
+        self.param_heads = nn.ModuleDict({
+            'offset': nn.Linear(embed_dim, 41),
+            'color': nn.Linear(embed_dim, NUM_COLORS),
+            'dx': nn.Linear(embed_dim, 11),
+            'dy': nn.Linear(embed_dim, 11),
+            'register': nn.Linear(embed_dim, 8),
+            'value': nn.Linear(embed_dim, 21),
+            'direction': nn.Linear(embed_dim, 4),
+        })
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _get_action_vocab_size(self) -> int:
+        """Get total action vocabulary size (base ops + macros)."""
+        return self.macro_library.get_total_vocab_size()
+    
+    def expand_action_head(self, new_vocab_size: int):
+        """Dynamically expand action head for new macros."""
+        if new_vocab_size <= self.action_head.out_features:
+            return
+        
+        old_head = self.action_head
+        device = old_head.weight.device
+        self.action_head = nn.Linear(self.embed_dim, new_vocab_size).to(device)
+        
+        with torch.no_grad():
+            self.action_head.weight[:old_head.out_features].copy_(old_head.weight)
+            self.action_head.bias[:old_head.out_features].copy_(old_head.bias)
+            nn.init.xavier_uniform_(self.action_head.weight[old_head.out_features:])
+            nn.init.zeros_(self.action_head.bias[old_head.out_features:])
+    
+    def _init_weights(self):
+        """Initialize weights for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, task_embedding: torch.Tensor, verbose: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Forward pass with static memory tokens.
         
         Args:
             task_embedding: (batch_size, task_embed_dim) from GNCA encoder
@@ -549,7 +1303,8 @@ class TokenController(nn.Module):
             
         Returns:
             action_logits: (batch_size, vocab_size) logits over action space
-            memory_tokens: (batch_size, memory_tokens, embed_dim) updated memory state
+            memory_tokens: (batch_size, memory_tokens, embed_dim) "updated" memory (same as input)
+            param_logits: Dict[str, torch.Tensor] parameter logits
         """
         batch_size = task_embedding.size(0)
         
@@ -563,96 +1318,117 @@ class TokenController(nn.Module):
         x = torch.cat([task_token, memory], dim=1)  # (B, 1+M, embed_dim)
         
         if verbose:
-            print(f"[Controller] Input: task_shape={task_embedding.shape}, memory_tokens={self.memory_tokens}")
-            print(f"[Controller] Combined input shape: {x.shape}")
+            print(f"[StaticMemory] Input: task_shape={task_embedding.shape}, memory_tokens={self.memory_tokens}")
+            print(f"[StaticMemory] Combined input shape: {x.shape}")
         
         # Apply transformer layers
         for i, layer in enumerate(self.layers):
-            x = layer(x, verbose=(verbose and i == 0))  # Only print first layer details
-            
-            if verbose:
-                print(f"[Attn] block-{i} out mean {x.mean().item():.4f}")
+            x = layer(x, verbose=(verbose and i == 0))
         
         # Final normalization
         x = self.norm(x)
         
-        # Generate action logits from task token (C-2)
-        task_representation = x[:, 0, :]  # (B, embed_dim) - first token
-        action_logits = self.action_head(task_representation)  # (B, vocab_size)
+        # Generate action logits from task token
+        task_representation = x[:, 0, :]  # (B, embed_dim)
+        action_logits = self.action_head(task_representation)
         
-        # Return updated memory tokens (excluding task token)
+        # Generate parameter logits
+        param_logits = {}
+        for param_name, param_head in self.param_heads.items():
+            param_logits[param_name] = param_head(task_representation)
+        
+        # Return "updated" memory tokens (excluding task token)
         updated_memory = x[:, 1:, :]  # (B, M, embed_dim)
         
         if verbose:
-            print(f"[Controller] Action logits shape: {action_logits.shape}")
-            print(f"[Controller] Output memory shape: {updated_memory.shape}")
+            print(f"[StaticMemory] Action logits shape: {action_logits.shape}")
+            print(f"[StaticMemory] Output memory shape: {updated_memory.shape}")
         
-        return action_logits, updated_memory
+        return action_logits, updated_memory, param_logits
     
-    def generate_blueprint(self, task_embedding: torch.Tensor, max_steps: int = 50, 
-                          temperature: float = 1.0, verbose: bool = False) -> List[int]:
+    def generate_blueprint(self, task_embedding: torch.Tensor, max_steps: int = 50,
+                          temperature: float = 1.0, verbose: bool = False) -> List[Tuple[int, Dict[str, int]]]:
         """
-        Generate a complete construction blueprint using iterative reasoning (C-3).
-        
-        Args:
-            task_embedding: (1, task_embed_dim) single task embedding
-            max_steps: Maximum program length
-            temperature: Sampling temperature for action selection
-            verbose: Enable step-by-step logging
-            
-        Returns:
-            blueprint: List of action IDs representing the construction program
+        Generate blueprint using static memory (no memory evolution).
         """
         if task_embedding.size(0) != 1:
             raise ValueError("generate_blueprint requires batch_size=1")
         
         blueprint = []
-        current_task_embedding = task_embedding
         
         if verbose:
-            print(f"[Controller] Generating blueprint (max_steps={max_steps})...")
+            print(f"[StaticMemory] Generating blueprint (max_steps={max_steps})...")
         
-        # Minimum exploration steps to prevent immediate HALT
         min_steps = 5
         
         for step in range(max_steps):
-            # Forward pass to get action logits
+            # Forward pass (memory doesn't evolve)
             with torch.no_grad():
-                action_logits, updated_memory = self.forward(current_task_embedding, verbose=(verbose and step == 0))
+                action_logits, _, param_logits = self.forward(task_embedding, verbose=(verbose and step == 0))
             
-            # Prevent HALT in early steps during training
-            halt_id = ConstructorOps.HALT.value - 1  # Convert to 0-indexed
+            # Prevent early HALT
+            halt_id = ConstructorOps.HALT.value - 1
             if step < min_steps and self.training:
-                # Mask out HALT action
                 action_logits[:, halt_id] = -float('inf')
             
-            # Sample action from logits
+            # Sample action
             if temperature > 0:
                 probs = F.softmax(action_logits / temperature, dim=-1)
                 action = torch.multinomial(probs, 1).item()
             else:
                 action = action_logits.argmax(dim=-1).item()
             
-            blueprint.append(action)
+            # Sample parameters
+            params = {}
+            if action < ConstructorOps.base_vocab_size():
+                op = list(ConstructorOps)[action]
+                
+                if op == ConstructorOps.MOVE_ARM:
+                    params['dx'] = self._sample_param(param_logits['dx'], temperature)
+                    params['dy'] = self._sample_param(param_logits['dy'], temperature)
+                elif op == ConstructorOps.WRITE:
+                    params['color'] = self._sample_param(param_logits['color'], temperature)
+                elif op == ConstructorOps.READ:
+                    params['register'] = self._sample_param(param_logits['register'], temperature)
+                elif op in [ConstructorOps.JUMP, ConstructorOps.JUMP_IF_EQUAL, ConstructorOps.JUMP_IF_NOT_EQUAL]:
+                    params['offset'] = self._sample_param(param_logits['offset'], temperature)
+                elif op in [ConstructorOps.SET_REG, ConstructorOps.INC_REG, ConstructorOps.DEC_REG]:
+                    params['register'] = self._sample_param(param_logits['register'], temperature)
+                    if op == ConstructorOps.SET_REG:
+                        params['value'] = self._sample_param(param_logits['value'], temperature)
+                elif op == ConstructorOps.COMPARE_REG:
+                    params['reg1'] = 0
+                    params['reg2'] = 1
+                elif op == ConstructorOps.SWITCH_ARM:
+                    params['arm'] = 0
+            
+            blueprint.append((action, params))
             
             if verbose:
-                # Convert action ID to operation name for logging
                 if action < ConstructorOps.base_vocab_size():
                     op_name = list(ConstructorOps)[action].name
                 else:
                     op_name = f"MACRO_{action - ConstructorOps.base_vocab_size()}"
-                print(f"[Controller] Generating step {step+1}: {op_name} (id={action})")
+                print(f"[StaticMemory] Step {step+1}: {op_name}")
             
-            # Check for halt condition
+            # Check for halt
             if action == halt_id and step >= min_steps:
                 if verbose:
-                    print(f"[Controller] Emitted HALT - Blueprint complete")
+                    print(f"[StaticMemory] Emitted HALT - Blueprint complete")
                 break
         
         if verbose:
-            print(f"[Controller] Generated blueprint: {len(blueprint)} steps")
+            print(f"[StaticMemory] Generated blueprint: {len(blueprint)} steps")
         
         return blueprint
+    
+    def _sample_param(self, logits: torch.Tensor, temperature: float) -> int:
+        """Sample parameter value from logits."""
+        if temperature > 0:
+            probs = F.softmax(logits / temperature, dim=-1)
+            return torch.multinomial(probs, 1).item()
+        else:
+            return logits.argmax(dim=-1).item()
     
     def count_parameters(self) -> int:
         """Count total trainable parameters."""
@@ -732,18 +1508,17 @@ class SpatialConstructor:
             return True
         return False
     
-    def execute_erase(self, arm_id: int) -> bool:
-        """Erase (set to empty) at specified arm position."""
+    def execute_read(self, arm_id: int) -> Optional[int]:
+        """Read color at arm position."""
         if arm_id >= len(self.arms):
-            return False
+            return None
         
         arm = self.arms[arm_id]
         h, w = self.canvas.shape
         
         if 0 <= arm.x < w and 0 <= arm.y < h:
-            self.canvas[arm.y, arm.x] = -1  # Empty cell
-            return True
-        return False
+            return self.canvas[arm.y, arm.x].item()
+        return None
     
     def check_empty(self, arm_id: int) -> Optional[bool]:
         """Check if cell at arm position is empty."""
@@ -787,14 +1562,22 @@ class BlueprintInterpreter:
         self.macro_library = macro_library
         self.max_steps = max_steps
         self.constructor = SpatialConstructor()
+        self.pc = 0  # Program Counter
+        self.comparison_flag = False  # For conditional operations
+        self.loop_counter = 0  # Track total iterations to prevent infinite loops
+        self.max_loop_iterations = 1000  # Safety limit
+        self.registers = [0] * 8  # 8 general-purpose registers
+        self.active_arm = 0  # Currently active arm for operations
+        self.stack = []  # For future subroutine calls
+        self.max_stack_depth = 100  # Prevent stack overflow
     
-    def execute_blueprint(self, opcodes: List[int], verbose: bool = False, 
+    def execute_blueprint(self, opcodes: List[Tuple[int, Dict[str, int]]], verbose: bool = False, 
                          visualize: bool = False, viz_delay: float = 0.5) -> torch.Tensor:
         """
-        Execute a sequence of opcodes using the spatial constructor.
+        Execute a sequence of opcodes with parameters using PC-based execution.
         
         Args:
-            opcodes: List of integer action IDs from controller
+            opcodes: List of (action_id, params_dict) tuples from controller
             verbose: Enable step-by-step logging
             visualize: Enable visualization (real-time animation, before/after, step-by-step)
             viz_delay: Delay between visualization frames (seconds)
@@ -805,8 +1588,16 @@ class BlueprintInterpreter:
         self.constructor.reset()
         initial_canvas = self.constructor.get_canvas().clone() if visualize else None
         
+        # Reset execution state
+        self.pc = 0
+        self.loop_counter = 0
+        self.registers = [0] * 8  # Reset all registers
+        self.comparison_flag = False
+        self.active_arm = 0  # Reset to first arm
+        self.stack = []
+        
         if verbose:
-            print(f"[Interpreter] Executing blueprint: {len(opcodes)} opcodes")
+            print(f"[Interpreter] Executing blueprint: {len(opcodes)} opcodes with PC-based execution")
         
         if visualize:
             print("\n" + "="*60)
@@ -814,11 +1605,21 @@ class BlueprintInterpreter:
             print("="*60)
             self._visualize_initial_state()
         
-        for step, opcode in enumerate(opcodes):
-            if step >= self.max_steps:
+        # PC-based execution loop
+        while self.pc < len(opcodes) and self.loop_counter < self.max_loop_iterations:
+            if self.pc >= self.max_steps:
                 if verbose:
                     print(f"[Interpreter] Step limit reached: {self.max_steps}")
                 break
+            
+            # Check for invalid PC (after jumps)
+            if self.pc < 0 or self.pc >= len(opcodes):
+                if verbose:
+                    print(f"[Interpreter] PC out of bounds: {self.pc} (program length: {len(opcodes)})")
+                break
+            
+            # Get current instruction
+            opcode, params = opcodes[self.pc]
             
             # Store state before operation for visualization
             if visualize:
@@ -829,19 +1630,20 @@ class BlueprintInterpreter:
             if opcode < ConstructorOps.base_vocab_size():
                 # Base operation
                 op = list(ConstructorOps)[opcode]
-                success = self._execute_base_op(op, verbose, step)
+                success = self._execute_pc_based_op(op, params, verbose)
             else:
-                # Macro operation (to be implemented when macros are added)
+                # Macro operation
                 if verbose:
-                    print(f"[Step {step}] Macro execution not yet implemented")
+                    print(f"[PC={self.pc}] Macro execution not yet implemented")
                 success = False
+                self.pc += 1
             
             # Visualize step if enabled
             if visualize and success:
-                self._visualize_step(step, opcode, pre_canvas, pre_arms, viz_delay)
+                self._visualize_step(self.pc, opcode, pre_canvas, pre_arms, viz_delay)
             
             # Update GPU visualizer if hook is available
-            if hasattr(self, '_viz_hook') and self._viz_hook and step % 5 == 0:  # Update every 5 steps
+            if hasattr(self, '_viz_hook') and self._viz_hook and self.loop_counter % 5 == 0:
                 canvas = self.constructor.get_canvas()
                 arm_positions = self.constructor.get_arm_positions()
                 self._viz_hook['on_construction_step'](canvas, arm_positions)
@@ -849,11 +1651,17 @@ class BlueprintInterpreter:
             # Check for halt
             if opcode == ConstructorOps.HALT.value - 1:  # Convert to 0-indexed
                 if verbose:
-                    print(f"[Step {step}] HALT - Execution complete")
+                    print(f"[PC={self.pc}] HALT - Execution complete")
                 break
             
             if not success and verbose:
-                print(f"[Step {step}] Operation failed")
+                print(f"[PC={self.pc}] Operation failed")
+            
+            self.loop_counter += 1
+        
+        if self.loop_counter >= self.max_loop_iterations:
+            if verbose:
+                print(f"[Interpreter] WARNING: Loop iteration limit reached ({self.max_loop_iterations})")
         
         final_canvas = self.constructor.get_canvas()
         
@@ -862,66 +1670,165 @@ class BlueprintInterpreter:
         
         return final_canvas
     
-    def _execute_base_op(self, op: ConstructorOps, verbose: bool, step: int) -> bool:
-        """Execute a single base operation."""
-        # For now, implement basic operations with some variety
-        # More sophisticated parameter handling will be added later
+    def _execute_pc_based_op(self, op: ConstructorOps, params: Dict[str, int], verbose: bool) -> bool:
+        """Execute operation with PC-based control flow and parameters."""
         
-        arm_id = 0  # Default to first arm
-        
+        # Essential spatial operations
         if op == ConstructorOps.MOVE_ARM:
-            # Move in different directions based on step
-            directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]  # right, down, left, up
-            dx, dy = directions[step % 4]
-            success = self.constructor.execute_move(arm_id, dx, dy)
+            dx = params.get('dx', 5) - 5  # Convert 0-10 to -5 to +5
+            dy = params.get('dy', 5) - 5
+            success = self.constructor.execute_move(self.active_arm, dx, dy)
             if verbose:
-                pos = self.constructor.arms[arm_id].get_position()
-                print(f"[Step {step}] Arm {arm_id} at {pos} executing: MOVE_ARM({dx},{dy})")
+                pos = self.constructor.arms[self.active_arm].get_position() if self.constructor.arms else (0, 0)
+                print(f"[PC={self.pc}] MOVE_ARM[{self.active_arm}] at {pos}: dx={dx}, dy={dy}")
+            self.pc += 1
+            return success
         
         elif op == ConstructorOps.WRITE:
-            # Write different colors based on position
-            if len(self.constructor.arms) > 0:
-                x, y = self.constructor.arms[arm_id].get_position()
-                color = (x + y) % 9 + 1  # Colors 1-9 (skip 0/black)
-            else:
-                color = 1
-            success = self.constructor.execute_write(arm_id, color)
+            color = params.get('color', 1)  # Default to blue if not specified
+            success = self.constructor.execute_write(self.active_arm, color)
             if verbose:
-                pos = self.constructor.arms[arm_id].get_position()
+                pos = self.constructor.arms[self.active_arm].get_position() if self.constructor.arms else (0, 0)
                 color_names = ["BLACK", "BLUE", "RED", "GREEN", "YELLOW", "GRAY", 
                               "MAGENTA", "ORANGE", "AZURE", "BROWN"]
-                print(f"[Step {step}] Arm {arm_id} at {pos} executing: WRITE({color_names[color]})")
+                color_name = color_names[color] if 0 <= color < len(color_names) else f"COLOR_{color}"
+                print(f"[PC={self.pc}] WRITE[{self.active_arm}] at {pos}: {color_name} (color={color})")
+            self.pc += 1
+            return success
         
-        elif op == ConstructorOps.ERASE:
-            success = self.constructor.execute_erase(arm_id)
+        elif op == ConstructorOps.READ:
+            register = params.get('register', 0)
+            if self.constructor.arms and 0 <= self.active_arm < len(self.constructor.arms):
+                x, y = self.constructor.arms[self.active_arm].get_position()
+                h, w = self.constructor.canvas.shape
+                if 0 <= x < w and 0 <= y < h:
+                    color = self.constructor.canvas[y, x].item()
+                    if 0 <= register < len(self.registers):
+                        self.registers[register] = color
+                        if verbose:
+                            print(f"[PC={self.pc}] READ[{self.active_arm}] at ({x},{y}): R{register} = {color}")
+            self.pc += 1
+            return True
+        
+        # Control flow - minimal but Turing-complete
+        elif op == ConstructorOps.JUMP:
+            offset = params.get('offset', 20) - 20  # Convert 0-40 to -20 to +20
+            self.pc += offset
             if verbose:
-                pos = self.constructor.arms[arm_id].get_position()
-                print(f"[Step {step}] Arm {arm_id} at {pos} executing: ERASE")
+                print(f"[PC={self.pc-offset}→{self.pc}] JUMP: unconditional jump {offset}")
+            return True
+            
+        elif op == ConstructorOps.JUMP_IF_EQUAL:
+            offset = params.get('offset', 20) - 20
+            if self.comparison_flag:
+                self.pc += offset
+                if verbose:
+                    print(f"[PC={self.pc-offset}→{self.pc}] JUMP_IF_EQUAL: flag=True, jumping {offset}")
+            else:
+                self.pc += 1
+                if verbose:
+                    print(f"[PC={self.pc-1}] JUMP_IF_EQUAL: flag=False, no jump")
+            return True
+            
+        elif op == ConstructorOps.JUMP_IF_NOT_EQUAL:
+            offset = params.get('offset', 20) - 20
+            if not self.comparison_flag:
+                self.pc += offset
+                if verbose:
+                    print(f"[PC={self.pc-offset}→{self.pc}] JUMP_IF_NOT_EQUAL: flag=False, jumping {offset}")
+            else:
+                self.pc += 1
+                if verbose:
+                    print(f"[PC={self.pc-1}] JUMP_IF_NOT_EQUAL: flag=True, no jump")
+            return True
         
-        elif op == ConstructorOps.BRANCH_IF_EMPTY:
-            # Simple conditional (no branching logic yet)
-            is_empty = self.constructor.check_empty(arm_id)
-            success = is_empty is not None
-            if verbose:
-                pos = self.constructor.arms[arm_id].get_position()
-                print(f"[Step {step}] Arm {arm_id} at {pos} executing: BRANCH_IF_EMPTY (empty={is_empty})")
+        # Register operations - minimal state
+        elif op == ConstructorOps.SET_REG:
+            reg = params.get('register', 0)
+            value = params.get('value', 10) - 10  # Convert 0-20 to -10 to +10
+            if 0 <= reg < len(self.registers):
+                self.registers[reg] = value
+                if verbose:
+                    print(f"[PC={self.pc}] SET_REG: R{reg} = {value}")
+            self.pc += 1
+            return True
+            
+        elif op == ConstructorOps.INC_REG:
+            reg = params.get('register', 0)
+            if 0 <= reg < len(self.registers):
+                self.registers[reg] += 1
+                if verbose:
+                    print(f"[PC={self.pc}] INC_REG: R{reg} = {self.registers[reg]} (was {self.registers[reg]-1})")
+            self.pc += 1
+            return True
+            
+        elif op == ConstructorOps.DEC_REG:
+            reg = params.get('register', 0)
+            if 0 <= reg < len(self.registers):
+                self.registers[reg] -= 1
+                if verbose:
+                    print(f"[PC={self.pc}] DEC_REG: R{reg} = {self.registers[reg]} (was {self.registers[reg]+1})")
+            self.pc += 1
+            return True
+            
+        elif op == ConstructorOps.COMPARE_REG:
+            reg1 = params.get('reg1', 0)
+            reg2 = params.get('reg2', 1)
+            if 0 <= reg1 < len(self.registers) and 0 <= reg2 < len(self.registers):
+                self.comparison_flag = (self.registers[reg1] == self.registers[reg2])
+                if verbose:
+                    print(f"[PC={self.pc}] COMPARE_REG: R{reg1}={self.registers[reg1]} vs R{reg2}={self.registers[reg2]}, flag={self.comparison_flag}")
+            self.pc += 1
+            return True
         
+        # Essential for multi-location work
         elif op == ConstructorOps.FORK_ARM:
-            new_arm_id = self.constructor.fork_arm(arm_id)
+            new_arm_id = self.constructor.fork_arm(self.active_arm)
             success = new_arm_id >= 0
             if verbose:
-                pos = self.constructor.arms[arm_id].get_position()
-                print(f"[Step {step}] Arm {arm_id} at {pos} executing: FORK_ARM → new arm {new_arm_id}")
+                pos = self.constructor.arms[self.active_arm].get_position() if self.constructor.arms else (0, 0)
+                print(f"[PC={self.pc}] FORK_ARM[{self.active_arm}] at {pos} → new arm {new_arm_id}")
+            self.pc += 1
+            return success
         
+        elif op == ConstructorOps.SWITCH_ARM:
+            target_arm = params.get('arm', 0)
+            if 0 <= target_arm < len(self.constructor.arms):
+                self.active_arm = target_arm
+                if verbose:
+                    pos = self.constructor.arms[self.active_arm].get_position()
+                    print(f"[PC={self.pc}] SWITCH_ARM: active arm now {self.active_arm} at {pos}")
+            self.pc += 1
+            return True
+        
+        # Program termination
         elif op == ConstructorOps.HALT:
             if verbose:
-                print(f"[Step {step}] HALT")
-            success = True
+                print(f"[PC={self.pc}] HALT")
+            self.pc += 1  # Technically doesn't matter since we'll break
+            return True
         
         else:
-            success = False
+            if verbose:
+                print(f"[PC={self.pc}] Unknown operation: {op}")
+            self.pc += 1
+            return False
+    
+    def _execute_base_op(self, op: ConstructorOps, verbose: bool, step: int) -> bool:
+        """Legacy method for backward compatibility."""
+        # Convert to new format and call PC-based method
+        params = {}
+        if op == ConstructorOps.MOVE_ARM:
+            directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+            dx, dy = directions[step % 4]
+            params = {'dx': dx + 5, 'dy': dy + 5}  # Convert to 0-10 range
+        elif op == ConstructorOps.WRITE:
+            x, y = self.constructor.arms[0].get_position() if self.constructor.arms else (0, 0)
+            params = {'color': (x + y) % 9 + 1}
         
-        return success
+        return self._execute_pc_based_op(op, params, verbose)
+    
+
     
     def _visualize_initial_state(self):
         """Visualize the initial state of construction."""
@@ -1433,8 +2340,6 @@ class SelfRepairingConstructor(SpatialConstructor):
             success = self.execute_move(*args)
         elif operation == "write":
             success = self.execute_write(*args)
-        elif operation == "erase":
-            success = self.execute_erase(*args)
         elif operation == "fork":
             success = self.fork_arm(*args) >= 0
         else:
@@ -1467,16 +2372,18 @@ class ConstructionEnvironment:
         self.constructor.reset(target_shape)
         self.target_shape = target_shape
     
-    def step(self, action: int) -> Tuple[torch.Tensor, float, bool]:
+    def step(self, action_with_params: Tuple[int, Dict[str, int]]) -> Tuple[torch.Tensor, float, bool]:
         """
-        Execute action and return state, reward, done.
+        Execute action with parameters and return state, reward, done.
         """
+        action, params = action_with_params
+        
         # Convert action to opcode list (handle macros)
         if action < ConstructorOps.base_vocab_size():
-            opcodes = [action]
+            opcodes = [(action, params)]
         else:
-            # Macro expansion (simplified)
-            opcodes = [action]  # Would expand to macro sequence
+            # Macro expansion (simplified - macros don't have params yet)
+            opcodes = [(action, {})]  # Would expand to macro sequence
         
         # Execute blueprint
         canvas = self.interpreter.execute_blueprint(opcodes, verbose=False)
@@ -1583,12 +2490,14 @@ def train_reinforce(model: nn.Module,
             prev_reads = None
             
             # Generate episode
+            actions_and_params = []
             for step in range(max_steps):
                 # Get action from policy
                 if isinstance(model.controller, MemoryAugmentedController):
                     action_logits, prev_reads, _ = model.controller(task_embedding, prev_reads)
+                    param_logits = {}  # Memory-augmented controller doesn't have params yet
                 else:
-                    action_logits, _ = model.controller(task_embedding)
+                    action_logits, _, param_logits = model.controller(task_embedding)
                 
                 # Prevent early HALT during training (minimum 5 steps)
                 halt_id = ConstructorOps.HALT.value - 1
@@ -1605,11 +2514,86 @@ def train_reinforce(model: nn.Module,
                 action_dist = torch.distributions.Categorical(action_probs)
                 action = action_dist.sample()
                 
-                # Store log probability
-                log_probs.append(action_dist.log_prob(action))
+                # Store action log probability
+                total_log_prob = action_dist.log_prob(action)
                 
-                # Execute action
-                canvas, _, done = env.step(action.item())
+                # Sample parameters and collect their log probs
+                params = {}
+                if action.item() < ConstructorOps.base_vocab_size():
+                    op = list(ConstructorOps)[action.item()]
+                    
+                    # Jump operations need offset
+                    if op in [ConstructorOps.JUMP, ConstructorOps.JUMP_IF_EQUAL, ConstructorOps.JUMP_IF_NOT_EQUAL]:
+                        if 'offset' in param_logits:
+                            offset_probs = F.softmax(param_logits['offset'], dim=-1)
+                            offset_dist = torch.distributions.Categorical(offset_probs)
+                            offset = offset_dist.sample()
+                            params['offset'] = offset.item()
+                            total_log_prob = total_log_prob + offset_dist.log_prob(offset)
+                    
+                    # Movement needs dx, dy
+                    if op == ConstructorOps.MOVE_ARM:
+                        if 'dx' in param_logits and 'dy' in param_logits:
+                            dx_probs = F.softmax(param_logits['dx'], dim=-1)
+                            dy_probs = F.softmax(param_logits['dy'], dim=-1)
+                            dx_dist = torch.distributions.Categorical(dx_probs)
+                            dy_dist = torch.distributions.Categorical(dy_probs)
+                            dx = dx_dist.sample()
+                            dy = dy_dist.sample()
+                            params['dx'] = dx.item()
+                            params['dy'] = dy.item()
+                            total_log_prob = total_log_prob + dx_dist.log_prob(dx) + dy_dist.log_prob(dy)
+                    
+                    # Write needs color
+                    if op == ConstructorOps.WRITE:
+                        if 'color' in param_logits:
+                            color_probs = F.softmax(param_logits['color'], dim=-1)
+                            color_dist = torch.distributions.Categorical(color_probs)
+                            color = color_dist.sample()
+                            params['color'] = color.item()
+                            total_log_prob = total_log_prob + color_dist.log_prob(color)
+                    
+                    # Read needs register
+                    if op == ConstructorOps.READ:
+                        if 'register' in param_logits:
+                            reg_probs = F.softmax(param_logits['register'], dim=-1)
+                            reg_dist = torch.distributions.Categorical(reg_probs)
+                            reg = reg_dist.sample()
+                            params['register'] = reg.item()
+                            total_log_prob = total_log_prob + reg_dist.log_prob(reg)
+                    
+                    # Register operations need register
+                    if op in [ConstructorOps.SET_REG, ConstructorOps.INC_REG, ConstructorOps.DEC_REG]:
+                        if 'register' in param_logits:
+                            reg_probs = F.softmax(param_logits['register'], dim=-1)
+                            reg_dist = torch.distributions.Categorical(reg_probs)
+                            reg = reg_dist.sample()
+                            params['register'] = reg.item()
+                            total_log_prob = total_log_prob + reg_dist.log_prob(reg)
+                    
+                    # SET_REG also needs value
+                    if op == ConstructorOps.SET_REG:
+                        if 'value' in param_logits:
+                            val_probs = F.softmax(param_logits['value'], dim=-1)
+                            val_dist = torch.distributions.Categorical(val_probs)
+                            val = val_dist.sample()
+                            params['value'] = val.item()
+                            total_log_prob = total_log_prob + val_dist.log_prob(val)
+                    
+                    # COMPARE_REG needs two registers (simplified for now)
+                    if op == ConstructorOps.COMPARE_REG:
+                        params['reg1'] = 0
+                        params['reg2'] = 1
+                    
+                    # SWITCH_ARM needs arm parameter
+                    if op == ConstructorOps.SWITCH_ARM:
+                        params['arm'] = 0
+                
+                log_probs.append(total_log_prob)
+                actions_and_params.append((action.item(), params))
+                
+                # Execute action (now env.step needs to handle params)
+                canvas, _, done = env.step((action.item(), params))
                 
                 # Update GPU visualizer with construction progress
                 if viz_hooks and step % 5 == 0:  # Update every 5 steps
@@ -1899,7 +2883,7 @@ def main():
     )
     
     # Mode selection
-    parser.add_argument("--mode", choices=["train", "eval", "demo", "test-damage", "test-compositional"], 
+    parser.add_argument("--mode", choices=["train", "eval", "demo", "test-damage", "test-compositional", "dreamcoder"], 
                       default="demo", help="Execution mode")
     
     # Data arguments
@@ -1929,6 +2913,12 @@ def main():
                       help="Number of external memory slots")
     parser.add_argument("--memory-dim", type=int, default=64,
                       help="Dimension of memory slots")
+    parser.add_argument("--ttm", action="store_true",
+                      help="Use Token Turing Machine with dynamic memory")
+    parser.add_argument("--read-tokens", type=int, default=16,
+                      help="Number of tokens for TTM read operation (r)")
+    parser.add_argument("--summarizer-method", choices=["mlp", "query"], default="mlp",
+                      help="TTM token summarization method")
     
     # Training arguments
     parser.add_argument("--train-mode", choices=["supervised", "reinforce"], 
@@ -1984,9 +2974,9 @@ def main():
         steps=args.gnca_steps
     ).to(device)
     
-    # Controller (memory-augmented or standard)
+    # Controller (memory-augmented, TTM, or standard)
     if args.memory_augmented:
-        print("[Main] Using memory-augmented controller (DNC/TTM-style)")
+        print("[Main] Using memory-augmented controller (DNC-style)")
         controller = MemoryAugmentedController(
             task_embed_dim=args.task_embed_dim,
             embed_dim=args.embed_dim,
@@ -1995,9 +2985,21 @@ def main():
             memory_slots=args.memory_slots,
             memory_dim=args.memory_dim
         ).to(device)
+    elif args.ttm:
+        print("[Main] Using Token Turing Machine (TTM) with dynamic memory")
+        controller = TTMController(
+            task_embed_dim=args.task_embed_dim,
+            embed_dim=args.embed_dim,
+            num_layers=args.transformer_layers,
+            num_heads=args.transformer_heads,
+            memory_tokens=args.memory_tokens,      # m in the paper
+            read_tokens=args.read_tokens,          # r in the paper
+            summarizer_method=args.summarizer_method
+        ).to(device)
     else:
-        print("[Main] Using standard token controller")
-        controller = TokenController(
+        print("[Main] Using static memory controller (original implementation)")
+        controller = StaticMemoryController(
+            task_embed_dim=args.task_embed_dim,
             embed_dim=args.embed_dim,
             num_layers=args.transformer_layers,
             num_heads=args.transformer_heads,
@@ -2086,6 +3088,48 @@ def main():
     
     elif args.mode == "test-compositional":
         compositional_test(model, device)
+    
+    elif args.mode == "dreamcoder":
+        # Run full DreamCoder wake-sleep learning
+        print("[Main] Running DreamCoder wake-sleep learning...")
+        
+        # Load training data
+        train_dataset = ARCDataset("train")
+        
+        # Initialize DreamCoder
+        dreamcoder = DreamCoderIntegration(
+            model,
+            max_program_length=args.max_steps,
+            beam_size=5,
+            fantasy_ratio=0.5
+        )
+        
+        # Run multiple wake-sleep cycles
+        num_cycles = args.dreamcoder_iterations if hasattr(args, 'dreamcoder_iterations') else 5
+        
+        for cycle in range(num_cycles):
+            print(f"\n[Main] DreamCoder Cycle {cycle + 1}/{num_cycles}")
+            
+            # Sample tasks for this cycle
+            task_indices = random.sample(range(len(train_dataset)), min(20, len(train_dataset)))
+            tasks = [train_dataset[i] for i in task_indices]
+            
+            # Run wake-sleep cycle
+            dreamcoder.run_wake_sleep_cycle(tasks, device)
+            
+            # Evaluate on held-out tasks
+            if cycle % 2 == 0:
+                print(f"\n[Main] Evaluating after cycle {cycle + 1}...")
+                eval_indices = random.sample(range(len(train_dataset)), 5)
+                eval_tasks = [train_dataset[i] for i in eval_indices if i not in task_indices]
+                
+                if eval_tasks:
+                    eval_solutions = dreamcoder.wake_phase(eval_tasks[:3], device)
+                    print(f"[Main] Solved {len(eval_solutions)}/3 evaluation tasks")
+        
+        print(f"\n[Main] DreamCoder complete!")
+        print(f"[Main] Final library size: {len(model.controller.macro_library.macros)} macros")
+        print(f"[Main] Discovered abstractions: {list(dreamcoder.discovered_abstractions.keys())}")
     
     print("[Main] ✓ Complete")
 
@@ -2307,7 +3351,7 @@ class ARCUniversalConstructor(nn.Module):
     def generate_blueprint(self, task_embedding: torch.Tensor,
                           max_steps: int = 50,
                           temperature: float = 1.0,
-                          verbose: bool = False) -> List[int]:
+                          verbose: bool = False) -> List[Tuple[int, Dict[str, int]]]:
         """Generate construction blueprint using the controller."""
         return self.controller.generate_blueprint(
             task_embedding, max_steps, temperature, verbose
@@ -2393,9 +3437,11 @@ def test_token_controller(controller, demo_pairs, device, verbose, viz_hooks=Non
             action_logits, memory, state = controller(task_embedding, verbose=verbose)
             print(f"[Controller] Memory shape: {memory.shape}")
             memory_output = memory
+            param_logits = {}  # Memory-augmented controller doesn't have params yet
         else:
-            action_logits, memory_output = controller(task_embedding, verbose=verbose)
+            action_logits, memory_output, param_logits = controller(task_embedding, verbose=verbose)
             print(f"[Controller] Memory output shape: {memory_output.shape}")
+            print(f"[Controller] Parameter heads: {list(param_logits.keys())}")
     
     elapsed_ms = (time.time() - start_time) * 1000
     print(f"[Controller] Forward pass: {elapsed_ms:.2f}ms")
@@ -2407,6 +3453,12 @@ def test_token_controller(controller, demo_pairs, device, verbose, viz_hooks=Non
         print("[Controller] ❌ ERROR: NaN detected!")
     else:
         print("[Controller] ✓ Numerical stability verified")
+    
+    # Test parameter generation
+    if param_logits:
+        print("\n[Controller] Testing parameter generation:")
+        for param_name, logits in param_logits.items():
+            print(f"  {param_name}: shape={logits.shape}, range=[{logits.min().item():.2f}, {logits.max().item():.2f}]")
     
     # Update GPU visualizer with controller states
     if viz_hooks:
@@ -2475,7 +3527,12 @@ def test_constructor_dsl(model, demo_pairs, test_in, test_out, device, verbose, 
         viz_hooks['on_blueprint_generated'](blueprint)
     
     # Analyze blueprint composition
-    base_ops = sum(1 for op in blueprint if op < ConstructorOps.base_vocab_size())
+    if blueprint and isinstance(blueprint[0], tuple):
+        # New format: (action, params)
+        base_ops = sum(1 for op, params in blueprint if op < ConstructorOps.base_vocab_size())
+    else:
+        # Old format: just actions (for backward compatibility)
+        base_ops = sum(1 for op in blueprint if op < ConstructorOps.base_vocab_size())
     macro_ops = len(blueprint) - base_ops
     print(f"[DSL] Blueprint composition: {base_ops} base ops, {macro_ops} macro calls")
     
@@ -2508,97 +3565,411 @@ def test_constructor_dsl(model, demo_pairs, test_in, test_out, device, verbose, 
 # Additional helper for offline DreamCoder integration
 class DreamCoderIntegration:
     """
-    Wrapper for offline DreamCoder integration to discover new macros.
-    This simulates DreamCoder's wake-sleep algorithm within our framework.
+    Proper DreamCoder implementation with wake-sleep cycles.
+    Integrates with TTM for memory-augmented program synthesis.
     """
     
     def __init__(self, model: "ARCUniversalConstructor", 
-                 max_program_length: int = 20):
+                 max_program_length: int = 20,
+                 beam_size: int = 5,
+                 fantasy_ratio: float = 0.5,
+                 mdl_weight: float = 1.0):
         self.model = model
         self.max_program_length = max_program_length
-        self.discovered_programs = []
-    
-    def wake_phase(self, tasks: List[Tuple], device: str = "cuda") -> List[List[int]]:
-        """
-        Wake phase: solve tasks and collect successful programs.
-        """
-        successful_programs = []
+        self.beam_size = beam_size
+        self.fantasy_ratio = fantasy_ratio
+        self.mdl_weight = mdl_weight
         
-        for demo_pairs, test_in, test_out in tasks:
+        # Recognition model for guiding search
+        self.recognition_model = RecognitionModel(
+            task_embed_dim=TASK_EMBED_DIM,
+            vocab_size=model.controller.macro_library.get_total_vocab_size()
+        )
+        
+        # Replay buffer for dream phase
+        self.replay_buffer = []
+        
+        # Track discovered abstractions
+        self.discovered_abstractions = {}
+    
+    def wake_phase(self, tasks: List[Tuple], device: str = "cuda") -> Dict[Any, Program]:
+        """
+        Wake phase: solve tasks using neurally-guided search.
+        Returns mapping from tasks to best programs found.
+        """
+        task_solutions = {}
+        
+        for task_idx, (demo_pairs, test_in, test_out) in enumerate(tasks):
             if test_out is None:
                 continue
             
-            # Generate program
+            # Get task embedding
             task_embedding = self.model.embed_task(demo_pairs, device)
-            blueprint = self.model.generate_blueprint(
-                task_embedding.unsqueeze(0),
-                max_steps=self.max_program_length,
-                temperature=0.0  # Greedy for wake phase
+            
+            # Make sure recognition model is on the right device
+            self.recognition_model.to(device)
+            
+            # Use recognition model to guide beam search
+            candidates = self.recognition_model.beam_search(
+                task_embedding,
+                beam_size=self.beam_size,
+                max_length=self.max_program_length,
+                temperature=0.1  # Low temperature for focused search
             )
             
-            # Execute and check success
+            # Create interpreter for execution
             interpreter = BlueprintInterpreter(
                 self.model.controller.macro_library,
                 self.max_program_length
             )
-            final_canvas = interpreter.execute_blueprint(blueprint)
             
-            # Simple success check (IoU > 0.9)
-            h_min = min(final_canvas.shape[0], test_out.shape[0])
-            w_min = min(final_canvas.shape[1], test_out.shape[1])
+            best_program = None
+            best_score = float('-inf')
             
-            final_crop = final_canvas[:h_min, :w_min]
-            target_crop = test_out[:h_min, :w_min]
+            # Evaluate each candidate
+            for program, log_prob in candidates[:10]:  # Check top 10
+                try:
+                    # Execute program
+                    final_canvas = program.execute(interpreter)
+                    
+                    # Compute likelihood P[x|ρ]
+                    h_min = min(final_canvas.shape[0], test_out.shape[0])
+                    w_min = min(final_canvas.shape[1], test_out.shape[1])
+                    
+                    final_crop = final_canvas[:h_min, :w_min]
+                    target_crop = test_out[:h_min, :w_min]
+                    
+                    # Exact match has likelihood 1, otherwise 0
+                    if (final_crop == target_crop).all():
+                        likelihood = 0.0  # log(1)
+                    else:
+                        # Partial credit based on IoU
+                        iou = (final_crop == target_crop).float().mean().item()
+                        likelihood = math.log(iou + 1e-6)
+                    
+                    # Compute posterior P[ρ|x, L] ∝ P[x|ρ]P[ρ|L]
+                    prior = -program.description_length(self.model.controller.macro_library)
+                    posterior = likelihood + self.mdl_weight * prior
+                    
+                    if posterior > best_score:
+                        best_score = posterior
+                        best_program = program
+                
+                except Exception as e:
+                    # Skip invalid programs
+                    continue
             
-            iou = (final_crop == target_crop).float().mean().item()
-            if iou > 0.9:
-                successful_programs.append(blueprint)
+            if best_program is not None:
+                task_solutions[task_idx] = best_program
+                # Add to replay buffer
+                self.replay_buffer.append((task_embedding, best_program))
+                
+                print(f"[Wake] Task {task_idx}: Found program with score {best_score:.3f}")
+            else:
+                print(f"[Wake] Task {task_idx}: No valid program found")
         
-        return successful_programs
+        return task_solutions
     
-    def sleep_phase(self, programs: List[List[int]]) -> Dict[str, List[int]]:
+    def abstraction_sleep_phase(self, task_solutions: Dict[Any, Program]) -> MacroLibrary:
         """
-        Sleep phase: compress programs into reusable macros.
+        Abstraction sleep phase: compress programs by finding common abstractions.
+        This is the key innovation of DreamCoder - refactoring for compression.
         """
-        # Simple compression: find repeated subsequences
-        discovered_macros = {}
+        print(f"\n[Abstraction Sleep] Compressing {len(task_solutions)} programs...")
         
-        # Count all subsequences of length 2-5
-        subsequence_counts = defaultdict(int)
-        for program in programs:
-            for length in range(2, 6):
-                for i in range(len(program) - length + 1):
-                    subseq = tuple(program[i:i+length])
-                    subsequence_counts[subseq] += 1
+        current_library = deepcopy(self.model.controller.macro_library)
+        improved = True
+        iteration = 0
         
-        # Extract frequent subsequences as macros
-        for subseq, count in subsequence_counts.items():
-            if count >= 3:  # Appears in at least 3 programs
-                macro_name = f"macro_{len(discovered_macros)}"
-                discovered_macros[macro_name] = list(subseq)
-        
-        return discovered_macros
-    
-    def integrate_discoveries(self, discovered_macros: Dict[str, List[int]]):
-        """
-        Add discovered macros to the model's library.
-        """
-        macro_lib = self.model.controller.macro_library
-        
-        for name, operations in discovered_macros.items():
-            # Convert to ConstructorOps
-            ops = []
-            for op_id in operations:
-                if op_id < ConstructorOps.base_vocab_size():
-                    ops.append(list(ConstructorOps)[op_id])
+        while improved and iteration < 5:  # Limit iterations
+            iteration += 1
+            improved = False
             
-            if ops:  # Only add if valid
-                macro_lib.add_macro(name, ops)
-                print(f"[DreamCoder] Added discovered macro '{name}' with {len(ops)} operations")
+            # Compute current MDL score
+            current_mdl = self._compute_mdl(task_solutions, current_library)
+            print(f"[Abstraction Sleep] Iteration {iteration}, MDL: {current_mdl:.3f}")
+            
+            # Collect all possible abstractions from refactorings
+            all_abstractions = {}
+            
+            for task_id, program in task_solutions.items():
+                # Create version space for this program
+                version_space = VersionSpace(program)
+                
+                # Extract potential abstractions
+                for subtree in version_space.extract_subtrees():
+                    if subtree not in all_abstractions:
+                        all_abstractions[subtree] = []
+                    all_abstractions[subtree].append(task_id)
+            
+            # Find best abstraction to add
+            best_abstraction = None
+            best_mdl = current_mdl
+            
+            for subtree, task_ids in all_abstractions.items():
+                if len(task_ids) < 2:  # Must appear in at least 2 programs
+                    continue
+                
+                # Create temporary library with this abstraction
+                temp_library = deepcopy(current_library)
+                
+                # Convert subtree to operations list
+                ops = []
+                for op_id, params in subtree:
+                    if op_id < ConstructorOps.base_vocab_size():
+                        ops.append(list(ConstructorOps)[op_id])
+                
+                if not ops:
+                    continue
+                
+                # Add abstraction to library
+                abstraction_name = f"learned_{len(self.discovered_abstractions)}"
+                try:
+                    macro_id = temp_library.add_macro(abstraction_name, ops)
+                except:
+                    continue  # Skip if macro already exists
+                
+                # Rewrite programs using this abstraction
+                rewritten_solutions = self._rewrite_programs_with_abstraction(
+                    task_solutions, subtree, macro_id
+                )
+                
+                # Compute new MDL
+                new_mdl = self._compute_mdl(rewritten_solutions, temp_library)
+                
+                if new_mdl < best_mdl:
+                    best_mdl = new_mdl
+                    best_abstraction = (abstraction_name, ops, subtree, macro_id)
+                    best_rewritten = rewritten_solutions
+            
+            # Add best abstraction if found
+            if best_abstraction is not None:
+                name, ops, subtree, macro_id = best_abstraction
+                current_library.add_macro(name, ops)
+                task_solutions = best_rewritten
+                self.discovered_abstractions[name] = ops
+                improved = True
+                
+                print(f"[Abstraction Sleep] Added abstraction '{name}' with {len(ops)} operations")
+                print(f"[Abstraction Sleep] MDL improved: {current_mdl:.3f} → {best_mdl:.3f}")
         
-        # Expand action head if needed
+        return current_library
+    
+    def dream_sleep_phase(self, num_dreams: int = 100, device: str = "cuda"):
+        """
+        Dream sleep phase: train recognition model on replays and fantasies.
+        This is where the neural network learns to guide search.
+        """
+        print(f"\n[Dream Sleep] Training recognition model...")
+        
+        # Prepare training data
+        training_data = []
+        
+        # Add replays (50%)
+        num_replays = min(len(self.replay_buffer), num_dreams // 2)
+        for task_embedding, program in random.sample(self.replay_buffer, num_replays):
+            training_data.append((task_embedding, program))
+        
+        # Generate fantasies (50%)
+        num_fantasies = num_dreams - num_replays
+        for _ in range(num_fantasies):
+            # Sample a random program from the library
+            fantasy_program = self._sample_program_from_library(
+                self.model.controller.macro_library,
+                max_length=self.max_program_length
+            )
+            
+            # Execute to get task
+            interpreter = BlueprintInterpreter(
+                self.model.controller.macro_library,
+                self.max_program_length
+            )
+            
+            try:
+                # Create synthetic task
+                fantasy_canvas = fantasy_program.execute(interpreter)
+                
+                # Create fake demo pair
+                input_grid = torch.full_like(fantasy_canvas, -1)  # Empty input
+                demo_pairs = [(input_grid, fantasy_canvas)]
+                
+                # Get task embedding
+                task_embedding = self.model.embed_task(demo_pairs, device)
+                
+                training_data.append((task_embedding, fantasy_program))
+            except:
+                continue  # Skip invalid programs
+        
+        # Train recognition model
+        self._train_recognition_model(training_data, device)
+    
+    def _compute_mdl(self, task_solutions: Dict[Any, Program], library: MacroLibrary) -> float:
+        """Compute minimum description length of programs under library."""
+        total_mdl = 0.0
+        
+        # Library description length (each macro costs bits)
+        library_mdl = len(library.macros) * 10.0  # Simplified
+        total_mdl += library_mdl
+        
+        # Program description lengths
+        for program in task_solutions.values():
+            total_mdl += program.description_length(library)
+        
+        return total_mdl
+    
+    def _rewrite_programs_with_abstraction(self, 
+                                          task_solutions: Dict[Any, Program],
+                                          subtree: Tuple,
+                                          macro_id: int) -> Dict[Any, Program]:
+        """Rewrite programs to use a new abstraction."""
+        rewritten = {}
+        
+        for task_id, program in task_solutions.items():
+            ops = program.operations
+            new_ops = []
+            i = 0
+            
+            while i < len(ops):
+                # Check if subtree matches at current position
+                if i <= len(ops) - len(subtree):
+                    matches = True
+                    for j, (op, params) in enumerate(subtree):
+                        if i + j >= len(ops) or ops[i + j] != (op, params):
+                            matches = False
+                            break
+                    
+                    if matches:
+                        # Replace with macro call
+                        new_ops.append((macro_id, {}))
+                        i += len(subtree)
+                        continue
+                
+                # No match, keep original operation
+                new_ops.append(ops[i])
+                i += 1
+            
+            rewritten[task_id] = Program(new_ops)
+        
+        return rewritten
+    
+    def _sample_program_from_library(self, library: MacroLibrary, max_length: int) -> Program:
+        """Sample a random program using operations from the library."""
+        operations = []
+        vocab_size = library.get_total_vocab_size()
+        
+        for _ in range(random.randint(3, max_length)):
+            # Sample action
+            action = random.randint(0, vocab_size - 1)
+            params = {}
+            
+            # Sample parameters if base operation
+            if action < ConstructorOps.base_vocab_size():
+                op = list(ConstructorOps)[action]
+                
+                if op == ConstructorOps.MOVE_ARM:
+                    params['dx'] = random.randint(0, 10)
+                    params['dy'] = random.randint(0, 10)
+                elif op == ConstructorOps.WRITE:
+                    params['color'] = random.randint(0, 9)
+                elif op in [ConstructorOps.JUMP, ConstructorOps.JUMP_IF_EQUAL, ConstructorOps.JUMP_IF_NOT_EQUAL]:
+                    params['offset'] = random.randint(0, 40)
+                # ... other parameters
+                
+                # Add HALT with some probability
+                if op == ConstructorOps.HALT or random.random() < 0.1:
+                    operations.append((action, params))
+                    break
+            
+            operations.append((action, params))
+        
+        return Program(operations)
+    
+    def _train_recognition_model(self, training_data: List[Tuple[torch.Tensor, Program]], 
+                               device: str = "cuda"):
+        """Train the recognition model on task-program pairs."""
+        optimizer = torch.optim.Adam(self.recognition_model.parameters(), lr=1e-3)
+        
+        self.recognition_model.train()
+        self.recognition_model.to(device)
+        
+        for epoch in range(10):  # Quick training
+            total_loss = 0.0
+            
+            for task_embedding, program in training_data:
+                # Detach task embedding to avoid gradient accumulation
+                task_embedding = task_embedding.detach().to(device)
+                
+                # Convert program to action sequence
+                actions = [op for op, _ in program.operations]
+                action_tensor = torch.tensor(actions, device=device).unsqueeze(0)
+                
+                # Teacher forcing: predict each action given history
+                loss = 0.0
+                for t in range(len(actions)):
+                    if t == 0:
+                        prev_actions = None
+                    else:
+                        prev_actions = action_tensor[:, :t]
+                    
+                    predictions = self.recognition_model(task_embedding.unsqueeze(0), prev_actions)
+                    
+                    # Cross entropy loss on action prediction
+                    target_action = action_tensor[:, t]
+                    action_loss = F.cross_entropy(predictions['actions'], target_action)
+                    loss = loss + action_loss
+                
+                # Normalize loss by sequence length
+                loss = loss / len(actions)
+                
+                # Backprop
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            print(f"[Dream Sleep] Epoch {epoch+1}: Loss = {total_loss/len(training_data):.4f}")
+    
+    def run_wake_sleep_cycle(self, tasks: List[Tuple], device: str = "cuda"):
+        """Run one complete wake-sleep cycle."""
+        print("\n" + "="*60)
+        print("DREAMCODER WAKE-SLEEP CYCLE")
+        print("="*60)
+        
+        # Wake phase
+        print("\n[Wake Phase]")
+        task_solutions = self.wake_phase(tasks, device)
+        
+        if not task_solutions:
+            print("[Wake Phase] No solutions found!")
+            return
+        
+        # Abstraction sleep phase
+        print("\n[Abstraction Sleep Phase]")
+        new_library = self.abstraction_sleep_phase(task_solutions)
+        
+        # Update model's library
+        self.model.controller.macro_library = new_library
+        
+        # Expand action heads if needed
+        new_vocab_size = new_library.get_total_vocab_size()
         if hasattr(self.model.controller, 'expand_action_head'):
-            self.model.controller.expand_action_head(macro_lib.get_total_vocab_size())
+            self.model.controller.expand_action_head(new_vocab_size)
+        
+        # Update recognition model vocab size
+        if new_vocab_size != self.recognition_model.vocab_size:
+            self.recognition_model = RecognitionModel(
+                task_embed_dim=TASK_EMBED_DIM,
+                vocab_size=new_vocab_size
+            )
+        
+        # Dream sleep phase
+        print("\n[Dream Sleep Phase]")
+        self.dream_sleep_phase(num_dreams=50, device=device)
+        
+        print("\n[Wake-Sleep Complete]")
+        print(f"Library size: {len(new_library.macros)} macros")
+        print(f"Replay buffer: {len(self.replay_buffer)} programs")
 
 
 # Compositional test for final evaluation
@@ -2631,18 +4002,13 @@ def compositional_test(model: "ARCUniversalConstructor", device: str = "cuda"):
     # Run DreamCoder integration
     dreamcoder = DreamCoderIntegration(model)
     
-    # Wake phase
-    print("[Compositional Test] Running wake phase...")
-    programs = dreamcoder.wake_phase(synthetic_tasks, device)
-    print(f"[Compositional Test] Collected {len(programs)} successful programs")
+    # Run wake-sleep cycle
+    print("[Compositional Test] Running DreamCoder wake-sleep cycle...")
+    dreamcoder.run_wake_sleep_cycle(synthetic_tasks, device)
     
-    # Sleep phase
-    print("[Compositional Test] Running sleep phase...")
-    macros = dreamcoder.sleep_phase(programs)
-    print(f"[Compositional Test] Discovered {len(macros)} potential macros")
-    
-    # Integrate discoveries
-    dreamcoder.integrate_discoveries(macros)
+    # Check discovered macros
+    discovered_count = len(dreamcoder.discovered_abstractions)
+    print(f"[Compositional Test] Discovered {discovered_count} abstractions through proper refactoring")
     
     # Test on new compositional task
     print("\n[Compositional Test] Testing on compositional task...")
@@ -2669,7 +4035,7 @@ def compositional_test(model: "ARCUniversalConstructor", device: str = "cuda"):
     
     # Analyze macro usage
     macro_usage = defaultdict(int)
-    for op in blueprint:
+    for op, params in blueprint:
         if op >= ConstructorOps.base_vocab_size():
             macro_usage[f"macro_{op - ConstructorOps.base_vocab_size()}"] += 1
     

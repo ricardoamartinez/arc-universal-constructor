@@ -21,12 +21,12 @@ Input: 3x3 grid with a red square in corner
 Output: 3x3 grid with blue squares in all corners
 
 What the system generates:
-[1, 4, 1, 0, 1, 0, 1, 0, 1, 5]
+[(2, {'color': 1}), (1, {'dx': 6, 'dy': 5}), (2, {'color': 1}), ...]
 
 Which translates to:
-[WRITE(blue), MOVE_ARM(right), WRITE(blue), MOVE_ARM(down), 
- WRITE(blue), MOVE_ARM(left), WRITE(blue), MOVE_ARM(down), 
- WRITE(blue), HALT]
+[WRITE(color=1), MOVE_ARM(dx=1, dy=0), WRITE(color=1), 
+ MOVE_ARM(dx=0, dy=1), WRITE(color=1), MOVE_ARM(dx=-1, dy=0), 
+ WRITE(color=1), HALT]
 
 What actually happens:
 Step 0: Write blue at (0,0)
@@ -62,25 +62,49 @@ Output: Constructed grid
 - Converts grid patterns to 64-dim vectors
 - 3,008 parameters total
 
-**Token Controller** (TTM-style):
-- TTM (Token Turing Machine) architecture with learnable memory tokens
-- 4-layer transformer (96-dim, 4 heads) 
-- 6 learnable memory tokens serve as writable scratchpad
-- Acts as policy network π(action|state) generating construction programs
-- Outputs logits over action vocabulary (6 base ops + macros)
-- 306,144 parameters
+**Controller Options**:
 
-**Memory-Augmented Controller** (alternative):
-- Enhanced version with 32-slot external memory (content-based addressing)
-- Combines TTM architecture with DNC-style external memory
-- Use with `--memory-augmented` flag
+1. **Static Memory Controller** (default):
+   - 4-layer transformer (96-dim, 4 heads) 
+   - 6 learnable memory tokens (fixed, don't change during inference)
+   - Acts as policy network π(action|state) generating construction programs
+   - 306,144 parameters
 
-**Action Vocabulary**:
-- `MOVE_ARM`: Move by (dx, dy) - currently hardcoded directions
-- `WRITE`: Write color at current position
-- `ERASE`: Clear current cell
-- `BRANCH_IF_EMPTY`: Conditional (no branching implemented yet)
+2. **Token Turing Machine Controller** (`--ttm`):
+   - True TTM implementation with dynamic memory evolution
+   - Read: Z_t = Sr([M_t || I_t]) - combines memory and input
+   - Process: O_t = Process(Z_t) - transforms via transformer
+   - Write: M_{t+1} = Sw([M_t || O_t || I_t]) - updates memory
+   - Memory evolves across blueprint generation steps
+   - 854,919 parameters (169% of static controller)
+
+3. **Memory-Augmented Controller** (`--memory-augmented`):
+   - Enhanced version with 32-slot external memory (content-based addressing)
+   - Combines transformer architecture with DNC-style external memory
+   - Read/write operations via attention mechanisms
+
+**Action Vocabulary** (Minimal Turing-Complete DSL):
+Following Von Neumann's principle of minimal fixed machinery:
+
+Spatial Operations:
+- `MOVE_ARM`: Move by learned parameters dx, dy ∈ {-5..+5}
+- `WRITE`: Write learned color parameter ∈ {0..9}
+- `READ`: Read cell color into register
+
+Control Flow (True Turing-Complete):
+- `JUMP`: Unconditional jump (PC + offset)
+- `JUMP_IF_EQUAL`: Jump if comparison flag is true
+- `JUMP_IF_NOT_EQUAL`: Jump if comparison flag is false
+
+State Management:
+- `SET_REG`: Set register to value
+- `INC_REG`/`DEC_REG`: Increment/decrement register
+- `COMPARE_REG`: Compare two registers, set flag
+
+Parallelism:
 - `FORK_ARM`: Create new construction arm
+- `SWITCH_ARM`: Switch active arm
+
 - `HALT`: Stop execution
 
 **Spatial Constructor**:
@@ -110,6 +134,9 @@ python arc_universal_constructor.py --mode demo --verbose
 
 # Visualize execution step-by-step
 python arc_universal_constructor.py --mode demo --viz
+
+# Use Token Turing Machine (dynamic memory)
+python arc_universal_constructor.py --mode demo --ttm
 ```
 
 ### Training
@@ -123,6 +150,12 @@ python arc_universal_constructor.py --mode train \
     --lr 1e-3 \
     --memory-augmented \
     --verbose
+
+# Train with Token Turing Machine
+python arc_universal_constructor.py --mode train --ttm --read-tokens 16
+
+# DreamCoder wake-sleep learning
+python arc_universal_constructor.py --mode dreamcoder --ttm
 ```
 
 ### What Actually Happens During Training
@@ -138,9 +171,9 @@ python arc_universal_constructor.py --mode train \
 
 ## Current Limitations
 
-1. **Action Parameters**: Operations like MOVE_ARM use hardcoded parameters. The model can't learn custom movement distances.
+1. ~~**Action Parameters**: Operations like MOVE_ARM use hardcoded parameters. The model can't learn custom movement distances.~~ ✅ FIXED: All actions now have learnable parameters.
 
-2. **No Real Branching**: BRANCH_IF_EMPTY exists but doesn't actually branch execution flow.
+2. ~~**No Real Branching**: BRANCH_IF_EMPTY exists but doesn't actually branch execution flow.~~ ✅ FIXED: True PC-based execution with jumps and conditionals.
 
 3. **Macro System**: Macro discovery works but macros are just stored sequences, not parameterized functions.
 
@@ -177,6 +210,21 @@ python arc_universal_constructor.py --mode test-compositional
 
 Finds sequences that appear 3+ times and adds them as new actions.
 
+### DreamCoder Integration
+```bash
+# Run full DreamCoder wake-sleep cycles
+python arc_universal_constructor.py --mode dreamcoder --ttm
+
+# More iterations for better abstraction discovery
+python arc_universal_constructor.py --mode dreamcoder --dreamcoder-iterations 10
+```
+
+Implements the DreamCoder algorithm:
+- **Wake Phase**: Neurally-guided program search with beam search
+- **Abstraction Sleep**: MDL-based compression to find common patterns
+- **Dream Sleep**: Train recognition model on replays + fantasies
+- Discovers reusable abstractions as new macro operations
+
 ### GPU Visualizer
 ```bash
 # Real-time training visualization with Dear PyGui
@@ -199,7 +247,7 @@ Shows:
 
 ## Code Structure
 
-- `arc_universal_constructor.py`: Everything in one file (~2700 lines)
+- `arc_universal_constructor.py`: Everything in one file (~3000 lines)
 - `arc_gpu_visualizer.py`: Dear PyGui visualizer (~600 lines)
 
 Key classes:
@@ -234,6 +282,8 @@ Most likely changes:
 ## Why This Approach?
 
 The hypothesis: explicit program synthesis might generalize better than direct pixel prediction. Results so far: unclear. The system can learn simple patterns but struggles with complex ARC tasks.
+
+**Key Design Principle**: Following Von Neumann's vision - minimal fixed machinery with maximal generality. The DSL contains only essential Turing-complete primitives. Complex behaviors (fill patterns, copy operations, search) must emerge from neural learning to compose these primitives, not from hardcoded operations.
 
 This implements ideas from:
 - Von Neumann's self-replicating automata
