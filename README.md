@@ -46,7 +46,7 @@ GNCA Encoder (3k params)
   ↓
 Task embedding (64-dim vector)
   ↓
-Token Controller (306k params)
+Token-based Memory Controller (TTM-style, 306k params)
   ↓
 Action sequence [WRITE, MOVE_ARM, WRITE, ..., HALT]
   ↓
@@ -62,15 +62,17 @@ Output: Constructed grid
 - Converts grid patterns to 64-dim vectors
 - 3,008 parameters total
 
-**Token Controller**:
-- 4-layer transformer (96-dim, 4 heads)
-- 6 learnable memory tokens concatenated with task embedding
+**Token Controller** (TTM-style):
+- TTM (Token Turing Machine) architecture with learnable memory tokens
+- 4-layer transformer (96-dim, 4 heads) 
+- 6 learnable memory tokens serve as writable scratchpad
+- Acts as policy network π(action|state) generating construction programs
 - Outputs logits over action vocabulary (6 base ops + macros)
 - 306,144 parameters
 
-**Memory-Augmented Controller** (optional):
-- Adds 32-slot external memory with content-based addressing
-- Based on Differentiable Neural Computer (DNC)
+**Memory-Augmented Controller** (alternative):
+- Enhanced version with 32-slot external memory (content-based addressing)
+- Combines TTM architecture with DNC-style external memory
 - Use with `--memory-augmented` flag
 
 **Action Vocabulary**:
